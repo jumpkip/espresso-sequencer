@@ -10,10 +10,7 @@ use clap::Args;
 use committable::Committable;
 use derive_more::From;
 use futures::FutureExt;
-use hotshot_types::{
-    traits::node_implementation::{NodeType, Versions},
-    utils::BuilderCommitment,
-};
+use hotshot_types::{traits::node_implementation::NodeType, utils::BuilderCommitment};
 use serde::{Deserialize, Serialize};
 use tagged_base64::TaggedBase64;
 use thiserror::Error;
@@ -21,6 +18,7 @@ use tide_disco::{api::ApiError, method::ReadState, Api, RequestError, RequestPar
 use vbs::version::StaticVersionType;
 
 use super::{
+    block_info::AvailableBlockHeaderInputV2,
     data_source::{AcceptsTxnSubmits, BuilderDataSource},
     Version,
 };
@@ -128,7 +126,7 @@ pub(crate) fn try_extract_param<T: for<'a> TryFrom<&'a TaggedBase64>>(
         })
 }
 
-pub fn define_api<State, Types: NodeType, V: Versions>(
+pub fn define_api<State, Types: NodeType>(
     options: &Options,
 ) -> Result<Api<State, Error, Version>, ApiError>
 where
@@ -148,7 +146,7 @@ where
                 let signature = try_extract_param(&req, "signature")?;
                 let sender = try_extract_param(&req, "sender")?;
                 state
-                    .available_blocks::<V>(&hash, view_number, sender, &signature)
+                    .available_blocks(&hash, view_number, sender, &signature)
                     .await
                     .map_err(|source| Error::BlockAvailable {
                         source,
@@ -209,6 +207,27 @@ where
                         source,
                         resource: block_hash.to_string(),
                     })
+            }
+            .boxed()
+        })?
+        .get("claim_header_input_v2", |req, state| {
+            async move {
+                let block_hash: BuilderCommitment = req.blob_param("block_hash")?;
+                let view_number = req.integer_param("view_number")?;
+                let signature = try_extract_param(&req, "signature")?;
+                let sender = try_extract_param(&req, "sender")?;
+                let out = state
+                    .claim_block_header_input(&block_hash, view_number, sender, &signature)
+                    .await
+                    .map_err(|source| Error::BlockClaim {
+                        source,
+                        resource: block_hash.to_string(),
+                    });
+
+                out.map(|input| AvailableBlockHeaderInputV2::<Types> {
+                    fee_signature: input.fee_signature,
+                    sender: input.sender,
+                })
             }
             .boxed()
         })?

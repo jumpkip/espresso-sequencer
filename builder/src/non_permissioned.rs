@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
+use std::{collections::VecDeque, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use async_broadcast::broadcast;
@@ -16,18 +16,14 @@ use hotshot_builder_core::{
     },
 };
 use hotshot_types::{
-    data::{fake_commitment, ViewNumber},
+    data::{fake_commitment, vid_commitment, ViewNumber},
     traits::{
-        block_contents::{vid_commitment, GENESIS_VID_NUM_STORAGE_NODES},
-        metrics::NoMetrics,
-        node_implementation::Versions,
-        EncodeBytes,
+        block_contents::GENESIS_VID_NUM_STORAGE_NODES, metrics::NoMetrics,
+        node_implementation::Versions, EncodeBytes,
     },
 };
-use marketplace_builder_shared::block::ParentBlockReferences;
-use marketplace_builder_shared::utils::EventServiceStream;
+use marketplace_builder_shared::{block::ParentBlockReferences, utils::EventServiceStream};
 use sequencer::{catchup::StatePeers, L1Params, SequencerApiVersion};
-use std::sync::Arc;
 use tide_disco::Url;
 use tokio::spawn;
 use vbs::version::StaticVersionType;
@@ -125,6 +121,7 @@ impl BuilderConfig {
             let payload_bytes = genesis_payload.encode();
             vid_commitment::<V>(
                 &payload_bytes,
+                &genesis_ns_table.encode(),
                 GENESIS_VID_NUM_STORAGE_NODES,
                 V::Base::VERSION,
             )
@@ -184,7 +181,7 @@ impl BuilderConfig {
         );
 
         // start the hotshot api service
-        run_builder_api_service::<V>(hotshot_builder_apis_url.clone(), proxy_global_state);
+        run_builder_api_service(hotshot_builder_apis_url.clone(), proxy_global_state);
 
         // spawn the builder service
         let events_url = hotshot_events_api_url.clone();

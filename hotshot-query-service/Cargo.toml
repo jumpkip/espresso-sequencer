@@ -23,7 +23,11 @@ default = ["file-system-data-source", "metrics-data-source", "sql-data-source"]
 # Enables support for an embedded SQLite database instead of PostgreSQL.
 # Ideal for lightweight nodes that benefit from pruning and merklized state storage,
 # offering advantages over file system storage.
-embedded-db = []
+embedded-db = ["sqlx/sqlite"]
+
+# As above, enables support for an embedded SQLite database instead of PostgreSQL.
+# But uses system SQlite instead of compiling the bundled version
+sqlite-unbundled = ["sqlx/sqlite-unbundled"]
 
 # Enable the availability data source backed by the local file system.
 file-system-data-source = ["atomic_store"]
@@ -75,6 +79,7 @@ jf-vid = { version = "0.1.0", git = "https://github.com/EspressoSystems/jellyfis
 ] }
 lazy_static = "1"
 prometheus = "0.13"
+semver = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 snafu = "0.8"
@@ -97,7 +102,7 @@ vbs = "0.1"
 vec1 = "1.12"
 
 # Dependencies enabled by feature "file-system-data-source".
-atomic_store = { git = "https://github.com/EspressoSystems/atomicstore.git", tag = "0.1.4", optional = true }
+atomic_store = { git = "https://github.com/EspressoSystems/atomicstore.git", tag = "0.1.5", optional = true }
 
 # Dependencies enabled by feature "sql-data-source".
 include_dir = { version = "0.7", optional = true }
@@ -108,7 +113,6 @@ sqlx = { version = "0.8", features = [
     "bit-vec",
     "postgres",
     "runtime-tokio",
-    "sqlite",
     "tls-native-tls",
 ], optional = true }
 

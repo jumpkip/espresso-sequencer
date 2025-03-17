@@ -7,25 +7,29 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use async_broadcast::{Receiver, SendError, Sender};
 use async_lock::RwLock;
 use committable::{Commitment, Committable};
+use either::Either;
 use hotshot_task::dependency::{Dependency, EventDependency};
 use hotshot_types::{
     consensus::OuterConsensus,
     data::{Leaf2, QuorumProposalWrapper, ViewChangeEvidence2},
+    epoch_membership::EpochMembershipCoordinator,
     event::{Event, EventType, LeafInfo},
     message::{Proposal, UpgradeLock},
     request_response::ProposalRequestPayload,
-    simple_certificate::{QuorumCertificate2, UpgradeCertificate},
+    simple_certificate::{NextEpochQuorumCertificate2, QuorumCertificate2, UpgradeCertificate},
     simple_vote::HasEpoch,
     traits::{
         block_contents::BlockHeader,
         election::Membership,
         node_implementation::{ConsensusTime, NodeImplementation, NodeType, Versions},
         signature_key::SignatureKey,
+        storage::Storage,
         BlockPayload, ValidatedState,
     },
     utils::{
@@ -33,6 +37,7 @@ use hotshot_types::{
         option_epoch_from_block_number, Terminator, View, ViewInner,
     },
     vote::{Certificate, HasViewNumber},
+    StakeTableEntries,
 };
 use hotshot_utils::anytrace::*;
 use tokio::time::timeout;
@@ -47,7 +52,7 @@ pub(crate) async fn fetch_proposal<TYPES: NodeType, V: Versions>(
     view_number: TYPES::View,
     event_sender: Sender<Arc<HotShotEvent<TYPES>>>,
     event_receiver: Receiver<Arc<HotShotEvent<TYPES>>>,
-    membership: Arc<RwLock<TYPES::Membership>>,
+    membership_coordinator: EpochMembershipCoordinator<TYPES>,
     consensus: OuterConsensus<TYPES>,
     sender_public_key: TYPES::SignatureKey,
     sender_private_key: <TYPES::SignatureKey as SignatureKey>::PrivateKey,
@@ -76,7 +81,7 @@ pub(crate) async fn fetch_proposal<TYPES: NodeType, V: Versions>(
     )
     .await;
 
-    let mem = Arc::clone(&membership);
+    let mem_coordinator = membership_coordinator.clone();
     // Make a background task to await the arrival of the event data.
     let Ok(Some(proposal)) =
         // We want to explicitly timeout here so we aren't waiting around for the data.
@@ -107,9 +112,14 @@ pub(crate) async fn fetch_proposal<TYPES: NodeType, V: Versions>(
                     if let HotShotEvent::QuorumProposalResponseRecv(quorum_proposal) =
                         hs_event.as_ref()
                     {
+                        let proposal_epoch = option_epoch_from_block_number::<TYPES>(
+                            quorum_proposal.data.proposal.epoch().is_some(),
+                            quorum_proposal.data.block_header().block_number(),
+                            epoch_height,
+                        );
+                        let epoch_membership = mem_coordinator.membership_for_epoch(proposal_epoch).await.ok()?;
                         // Make sure that the quorum_proposal is valid
-                        let mem_reader = mem.read().await;
-                        if quorum_proposal.validate_signature(&mem_reader, epoch_height).is_ok() {
+                        if quorum_proposal.validate_signature(&epoch_membership).await.is_ok() {
                             proposal = Some(quorum_proposal.clone());
                         }
 
@@ -131,14 +141,15 @@ pub(crate) async fn fetch_proposal<TYPES: NodeType, V: Versions>(
 
     let justify_qc_epoch = justify_qc.data.epoch();
 
-    let membership_reader = membership.read().await;
-    let membership_stake_table = membership_reader.stake_table(justify_qc_epoch);
-    let membership_success_threshold = membership_reader.success_threshold(justify_qc_epoch);
-    drop(membership_reader);
+    let epoch_membership = membership_coordinator
+        .membership_for_epoch(justify_qc_epoch)
+        .await?;
+    let membership_stake_table = epoch_membership.stake_table().await;
+    let membership_success_threshold = epoch_membership.success_threshold().await;
 
     justify_qc
         .is_valid_cert(
-            membership_stake_table,
+            StakeTableEntries::<TYPES>::from(membership_stake_table).0,
             membership_success_threshold,
             upgrade_lock,
         )
@@ -171,36 +182,38 @@ pub(crate) async fn fetch_proposal<TYPES: NodeType, V: Versions>(
 }
 
 /// Handles calling add_epoch_root and sync_l1 on Membership if necessary.
-async fn decide_epoch_root<TYPES: NodeType>(
+async fn decide_epoch_root<TYPES: NodeType, I: NodeImplementation<TYPES>>(
     decided_leaf: &Leaf2<TYPES>,
     epoch_height: u64,
     membership: &Arc<RwLock<TYPES::Membership>>,
+    storage: &Arc<RwLock<I::Storage>>,
 ) {
     let decided_block_number = decided_leaf.block_header().block_number();
 
     // Skip if this is not the expected block.
     if epoch_height != 0 && is_epoch_root(decided_block_number, epoch_height) {
         let next_epoch_number =
-            TYPES::Epoch::new(epoch_from_block_number(decided_block_number, epoch_height) + 1);
+            TYPES::Epoch::new(epoch_from_block_number(decided_block_number, epoch_height) + 2);
+
+        if let Err(e) = storage
+            .write()
+            .await
+            .add_epoch_root(next_epoch_number, decided_leaf.block_header().clone())
+            .await
+        {
+            tracing::error!(
+                "Failed to store epoch root for epoch {:?}: {}",
+                next_epoch_number,
+                e
+            );
+        }
 
         let write_callback = {
+            tracing::debug!("Calling add_epoch_root for epoch {:?}", next_epoch_number);
             let membership_reader = membership.read().await;
             membership_reader
                 .add_epoch_root(next_epoch_number, decided_leaf.block_header().clone())
                 .await
-        };
-
-        if let Some(write_callback) = write_callback {
-            let mut membership_writer = membership.write().await;
-            write_callback(&mut *membership_writer);
-        } else {
-            // If we didn't get a write callback out of add_epoch_root, then don't bother locking and calling sync_l1
-            return;
-        }
-
-        let write_callback = {
-            let membership_reader = membership.read().await;
-            membership_reader.sync_l1().await
         };
 
         if let Some(write_callback) = write_callback {
@@ -254,13 +267,14 @@ impl<TYPES: NodeType + Default> Default for LeafChainTraversalOutcome<TYPES> {
 /// # Panics
 /// If the leaf chain contains no decided leaf while reaching a decided view, which should be
 /// impossible.
-pub async fn decide_from_proposal_2<TYPES: NodeType>(
+pub async fn decide_from_proposal_2<TYPES: NodeType, I: NodeImplementation<TYPES>>(
     proposal: &QuorumProposalWrapper<TYPES>,
     consensus: OuterConsensus<TYPES>,
     existing_upgrade_cert: Arc<RwLock<Option<UpgradeCertificate<TYPES>>>>,
     public_key: &TYPES::SignatureKey,
     with_epochs: bool,
     membership: &Arc<RwLock<TYPES::Membership>>,
+    storage: &Arc<RwLock<I::Storage>>,
 ) -> LeafChainTraversalOutcome<TYPES> {
     let mut res = LeafChainTraversalOutcome::default();
     let consensus_reader = consensus.read().await;
@@ -306,7 +320,6 @@ pub async fn decide_from_proposal_2<TYPES: NodeType>(
             }
         }
 
-        res.leaf_views.push(info.clone());
         // If the block payload is available for this leaf, include it in
         // the leaf chain that we send to the client.
         if let Some(payload) = consensus_reader
@@ -314,7 +327,7 @@ pub async fn decide_from_proposal_2<TYPES: NodeType>(
             .get(&info.leaf.view_number())
         {
             info.leaf
-                .fill_block_payload_unchecked(payload.as_ref().clone());
+                .fill_block_payload_unchecked(payload.as_ref().payload.clone());
         }
 
         if let Some(ref payload) = info.leaf.block_payload() {
@@ -324,6 +337,7 @@ pub async fn decide_from_proposal_2<TYPES: NodeType>(
         }
 
         current_leaf_info = consensus_reader.parent_leaf_info(&info.leaf, public_key);
+        res.leaf_views.push(info.clone());
     }
 
     if !txns.is_empty() {
@@ -334,10 +348,14 @@ pub async fn decide_from_proposal_2<TYPES: NodeType>(
         let epoch_height = consensus_reader.epoch_height;
         drop(consensus_reader);
 
-        if let Some(decided_leaf_info) = res.leaf_views.last() {
-            decide_epoch_root(&decided_leaf_info.leaf, epoch_height, membership).await;
-        } else {
-            tracing::info!("No decided leaf while a view has been decided.");
+        for decided_leaf_info in &res.leaf_views {
+            decide_epoch_root::<TYPES, I>(
+                &decided_leaf_info.leaf,
+                epoch_height,
+                membership,
+                storage,
+            )
+            .await;
         }
     }
 
@@ -375,13 +393,14 @@ pub async fn decide_from_proposal_2<TYPES: NodeType>(
 /// # Panics
 /// If the leaf chain contains no decided leaf while reaching a decided view, which should be
 /// impossible.
-pub async fn decide_from_proposal<TYPES: NodeType>(
+pub async fn decide_from_proposal<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions>(
     proposal: &QuorumProposalWrapper<TYPES>,
     consensus: OuterConsensus<TYPES>,
     existing_upgrade_cert: Arc<RwLock<Option<UpgradeCertificate<TYPES>>>>,
     public_key: &TYPES::SignatureKey,
     with_epochs: bool,
     membership: &Arc<RwLock<TYPES::Membership>>,
+    storage: &Arc<RwLock<I::Storage>>,
 ) -> LeafChainTraversalOutcome<TYPES> {
     let consensus_reader = consensus.read().await;
     let existing_upgrade_cert_reader = existing_upgrade_cert.read().await;
@@ -453,7 +472,7 @@ pub async fn decide_from_proposal<TYPES: NodeType>(
                 // If the block payload is available for this leaf, include it in
                 // the leaf chain that we send to the client.
                 if let Some(payload) = consensus_reader.saved_payloads().get(&leaf.view_number()) {
-                    leaf.fill_block_payload_unchecked(payload.as_ref().clone());
+                    leaf.fill_block_payload_unchecked(payload.as_ref().payload.clone());
                 }
 
                 // Get the VID share at the leaf's view number, corresponding to our key
@@ -488,14 +507,18 @@ pub async fn decide_from_proposal<TYPES: NodeType>(
         tracing::debug!("Leaf ascension failed; error={e}");
     }
 
-    if with_epochs && res.new_decided_view_number.is_some() {
-        let epoch_height = consensus_reader.epoch_height;
-        drop(consensus_reader);
+    let epoch_height = consensus_reader.epoch_height;
+    drop(consensus_reader);
 
-        if let Some(decided_leaf_info) = res.leaf_views.last() {
-            decide_epoch_root(&decided_leaf_info.leaf, epoch_height, membership).await;
-        } else {
-            tracing::info!("No decided leaf while a view has been decided.");
+    if with_epochs && res.new_decided_view_number.is_some() {
+        for decided_leaf_info in &res.leaf_views {
+            decide_epoch_root::<TYPES, I>(
+                &decided_leaf_info.leaf,
+                epoch_height,
+                membership,
+                storage,
+            )
+            .await;
         }
     }
 
@@ -508,7 +531,7 @@ pub async fn decide_from_proposal<TYPES: NodeType>(
 pub(crate) async fn parent_leaf_and_state<TYPES: NodeType, V: Versions>(
     event_sender: &Sender<Arc<HotShotEvent<TYPES>>>,
     event_receiver: &Receiver<Arc<HotShotEvent<TYPES>>>,
-    membership: Arc<RwLock<TYPES::Membership>>,
+    membership: EpochMembershipCoordinator<TYPES>,
     public_key: TYPES::SignatureKey,
     private_key: <TYPES::SignatureKey as SignatureKey>::PrivateKey,
     consensus: OuterConsensus<TYPES>,
@@ -591,8 +614,14 @@ pub async fn validate_proposal_safety_and_liveness<
         proposed_leaf.parent_commitment() == parent_leaf.commit(),
         "Proposed leaf does not extend the parent leaf."
     );
-    let proposal_epoch =
-        epoch_from_block_number(proposed_leaf.height(), validation_info.epoch_height);
+    let proposal_epoch = option_epoch_from_block_number::<TYPES>(
+        validation_info
+            .upgrade_lock
+            .epochs_enabled(view_number)
+            .await,
+        proposed_leaf.height(),
+        validation_info.epoch_height,
+    );
 
     let state = Arc::new(
         <TYPES::ValidatedState as ValidatedState<TYPES>>::from_header(proposal.data.block_header()),
@@ -614,9 +643,7 @@ pub async fn validate_proposal_safety_and_liveness<
     UpgradeCertificate::validate(
         proposal.data.upgrade_certificate(),
         &validation_info.membership,
-        proposed_leaf
-            .with_epoch
-            .then(|| TYPES::Epoch::new(proposal_epoch)), // #3967 how do we know if proposal_epoch should be Some() or None?
+        proposal_epoch,
         &validation_info.upgrade_lock,
     )
     .await?;
@@ -639,8 +666,14 @@ pub async fn validate_proposal_safety_and_liveness<
         // The proposal is safe if
         // 1. the proposed block and the justify QC block belong to the same epoch or
         // 2. the justify QC is the eQC for the previous block
-        let justify_qc_epoch =
-            epoch_from_block_number(parent_leaf.height(), validation_info.epoch_height);
+        let justify_qc_epoch = option_epoch_from_block_number::<TYPES>(
+            validation_info
+                .upgrade_lock
+                .epochs_enabled(view_number)
+                .await,
+            parent_leaf.height(),
+            validation_info.epoch_height,
+        );
         ensure!(
             proposal_epoch == justify_qc_epoch
                 || consensus_reader.check_eqc(&proposed_leaf, &parent_leaf),
@@ -654,7 +687,12 @@ pub async fn validate_proposal_safety_and_liveness<
         );
 
         // Make sure that the epoch transition proposal includes the next epoch QC
-        if is_last_block_in_epoch(parent_leaf.height(), validation_info.epoch_height) {
+        if is_last_block_in_epoch(parent_leaf.height(), validation_info.epoch_height)
+            && validation_info
+                .upgrade_lock
+                .epochs_enabled(view_number)
+                .await
+        {
             ensure!(proposal.data.next_epoch_justify_qc().is_some(),
             "Epoch transition proposal does not include the next epoch justify QC. Do not vote!");
         }
@@ -740,9 +778,8 @@ pub(crate) async fn validate_proposal_view_and_certs<
     );
 
     // Validate the proposal's signature. This should also catch if the leaf_commitment does not equal our calculated parent commitment
-    let membership_reader = validation_info.membership.read().await;
-    proposal.validate_signature(&membership_reader, validation_info.epoch_height)?;
-    drop(membership_reader);
+    let mut membership = validation_info.membership.clone();
+    proposal.validate_signature(&membership).await?;
 
     // Verify a timeout certificate OR a view sync certificate exists and is valid.
     if proposal.data.justify_qc().view_number() != view_number - 1 {
@@ -760,16 +797,14 @@ pub(crate) async fn validate_proposal_view_and_certs<
                     *view_number
                 );
                 let timeout_cert_epoch = timeout_cert.data().epoch();
+                membership = membership.get_new_epoch(timeout_cert_epoch).await?;
 
-                let membership_reader = validation_info.membership.read().await;
-                let membership_stake_table = membership_reader.stake_table(timeout_cert_epoch);
-                let membership_success_threshold =
-                    membership_reader.success_threshold(timeout_cert_epoch);
-                drop(membership_reader);
+                let membership_stake_table = membership.stake_table().await;
+                let membership_success_threshold = membership.success_threshold().await;
 
                 timeout_cert
                     .is_valid_cert(
-                        membership_stake_table,
+                        StakeTableEntries::<TYPES>::from(membership_stake_table).0,
                         membership_success_threshold,
                         &validation_info.upgrade_lock,
                     )
@@ -780,7 +815,7 @@ pub(crate) async fn validate_proposal_view_and_certs<
                             *view_number, e
                         )
                     })?;
-            }
+            },
             ViewChangeEvidence2::ViewSync(view_sync_cert) => {
                 ensure!(
                     view_sync_cert.view_number == view_number,
@@ -790,23 +825,21 @@ pub(crate) async fn validate_proposal_view_and_certs<
                 );
 
                 let view_sync_cert_epoch = view_sync_cert.data().epoch();
+                membership = membership.get_new_epoch(view_sync_cert_epoch).await?;
 
-                let membership_reader = validation_info.membership.read().await;
-                let membership_stake_table = membership_reader.stake_table(view_sync_cert_epoch);
-                let membership_success_threshold =
-                    membership_reader.success_threshold(view_sync_cert_epoch);
-                drop(membership_reader);
+                let membership_stake_table = membership.stake_table().await;
+                let membership_success_threshold = membership.success_threshold().await;
 
                 // View sync certs must also be valid.
                 view_sync_cert
                     .is_valid_cert(
-                        membership_stake_table,
+                        StakeTableEntries::<TYPES>::from(membership_stake_table).0,
                         membership_success_threshold,
                         &validation_info.upgrade_lock,
                     )
                     .await
                     .context(|e| warn!("Invalid view sync finalize cert provided: {}", e))?;
-            }
+            },
         }
     }
 
@@ -839,12 +872,127 @@ pub async fn broadcast_event<E: Clone + std::fmt::Debug>(event: E, sender: &Send
                 "Event sender queue overflow, Oldest event removed form queue: {:?}",
                 overflowed
             );
-        }
+        },
         Err(SendError(e)) => {
             tracing::warn!(
                 "Event: {:?}\n Sending failed, event stream probably shutdown",
                 e
             );
-        }
+        },
     }
+}
+
+/// Gets the next epoch QC corresponding to this epoch QC from the shared consensus state;
+/// if it's not yet available, waits for it with a given timeout.
+pub async fn wait_for_next_epoch_qc<TYPES: NodeType>(
+    high_qc: &QuorumCertificate2<TYPES>,
+    consensus: &OuterConsensus<TYPES>,
+    timeout: u64,
+    view_start_time: Instant,
+    receiver: &Receiver<Arc<HotShotEvent<TYPES>>>,
+) -> Option<NextEpochQuorumCertificate2<TYPES>> {
+    tracing::debug!("getting the next epoch QC");
+    if let Some(next_epoch_qc) = consensus.read().await.next_epoch_high_qc() {
+        if next_epoch_qc.data.leaf_commit == high_qc.data.leaf_commit {
+            // We have it already, no reason to wait
+            return Some(next_epoch_qc.clone());
+        }
+    };
+
+    let wait_duration = Duration::from_millis(timeout / 2);
+
+    // TODO configure timeout
+    let Some(time_spent) = Instant::now().checked_duration_since(view_start_time) else {
+        // Shouldn't be possible, now must be after the start
+        return None;
+    };
+    let Some(time_left) = wait_duration.checked_sub(time_spent) else {
+        // No time left
+        return None;
+    };
+    let receiver = receiver.clone();
+    let Ok(Some(event)) = tokio::time::timeout(time_left, async move {
+        let this_epoch_high_qc = high_qc.clone();
+        EventDependency::new(
+            receiver,
+            Box::new(move |event| {
+                let event = event.as_ref();
+                if let HotShotEvent::NextEpochQc2Formed(Either::Left(qc)) = event {
+                    qc.data.leaf_commit == this_epoch_high_qc.data.leaf_commit
+                } else {
+                    false
+                }
+            }),
+        )
+        .completed()
+        .await
+    })
+    .await
+    else {
+        // Check again, there is a chance we missed it
+        if let Some(next_epoch_qc) = consensus.read().await.next_epoch_high_qc() {
+            if next_epoch_qc.data.leaf_commit == high_qc.data.leaf_commit {
+                return Some(next_epoch_qc.clone());
+            }
+        };
+        return None;
+    };
+    let HotShotEvent::NextEpochQc2Formed(Either::Left(next_epoch_qc)) = event.as_ref() else {
+        // this shouldn't happen
+        return None;
+    };
+    Some(next_epoch_qc.clone())
+}
+
+/// Validates qc's signatures and, if provided, validates next_epoch_qc's signatures and whether it
+/// corresponds to the provided high_qc.
+pub async fn validate_qc_and_next_epoch_qc<TYPES: NodeType, V: Versions>(
+    qc: &QuorumCertificate2<TYPES>,
+    maybe_next_epoch_qc: Option<&NextEpochQuorumCertificate2<TYPES>>,
+    consensus: &OuterConsensus<TYPES>,
+    membership_coordinator: &EpochMembershipCoordinator<TYPES>,
+    upgrade_lock: &UpgradeLock<TYPES, V>,
+) -> Result<()> {
+    let mut epoch_membership = membership_coordinator
+        .membership_for_epoch(qc.data.epoch)
+        .await?;
+
+    let membership_stake_table = epoch_membership.stake_table().await;
+    let membership_success_threshold = epoch_membership.success_threshold().await;
+
+    {
+        let consensus_reader = consensus.read().await;
+        qc.is_valid_cert(
+            StakeTableEntries::<TYPES>::from(membership_stake_table).0,
+            membership_success_threshold,
+            upgrade_lock,
+        )
+        .await
+        .context(|e| {
+            consensus_reader.metrics.invalid_qc.update(1);
+
+            warn!("Invalid certificate: {}", e)
+        })?;
+    }
+
+    if let Some(next_epoch_qc) = maybe_next_epoch_qc {
+        // If the next epoch qc exists, make sure it's equal to the qc
+        if qc.view_number() != next_epoch_qc.view_number() || qc.data != *next_epoch_qc.data {
+            bail!("Next epoch qc exists but it's not equal with qc.");
+        }
+        epoch_membership = epoch_membership.next_epoch().await?;
+        let membership_next_stake_table = epoch_membership.stake_table().await;
+        let membership_next_success_threshold = epoch_membership.success_threshold().await;
+
+        // Validate the next epoch qc as well
+        next_epoch_qc
+            .is_valid_cert(
+                StakeTableEntries::<TYPES>::from(membership_next_stake_table).0,
+                membership_next_success_threshold,
+                upgrade_lock,
+            )
+            .await
+            .context(|e| warn!("Invalid next epoch certificate: {}", e))?;
+    }
+    Ok(())
 }

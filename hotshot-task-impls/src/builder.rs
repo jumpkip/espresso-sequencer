@@ -12,11 +12,8 @@ use hotshot_builder_api::v0_1::{
 };
 use hotshot_types::{
     constants::LEGACY_BUILDER_MODULE,
-    traits::{
-        node_implementation::{NodeType, Versions},
-        signature_key::SignatureKey,
-    },
-    vid::VidCommitment,
+    data::VidCommitment,
+    traits::{node_implementation::NodeType, signature_key::SignatureKey},
 };
 use serde::{Deserialize, Serialize};
 use surf_disco::{client::HealthStatus, Client, Url};
@@ -46,10 +43,10 @@ impl From<BuilderApiError> for BuilderClientError {
         match value {
             BuilderApiError::Request(source) | BuilderApiError::TxnUnpack(source) => {
                 Self::Api(source.to_string())
-            }
+            },
             BuilderApiError::TxnSubmit(source) | BuilderApiError::BuilderAddress(source) => {
                 Self::Api(source.to_string())
-            }
+            },
             BuilderApiError::Custom { message, .. } => Self::Api(message),
             BuilderApiError::BlockAvailable { source, .. }
             | BuilderApiError::BlockClaim { source, .. } => match source {
@@ -111,7 +108,7 @@ impl<TYPES: NodeType, Ver: StaticVersionType> BuilderClient<TYPES, Ver> {
     /// # Errors
     /// - [`BuilderClientError::BlockNotFound`] if blocks aren't available for this parent
     /// - [`BuilderClientError::Api`] if API isn't responding or responds incorrectly
-    pub async fn available_blocks<V: Versions>(
+    pub async fn available_blocks(
         &self,
         parent: VidCommitment,
         view_number: u64,
@@ -131,7 +128,7 @@ impl<TYPES: NodeType, Ver: StaticVersionType> BuilderClient<TYPES, Ver> {
 
 /// Version 0.1
 pub mod v0_1 {
-    use hotshot_builder_api::v0_1::block_info::{AvailableBlockData, AvailableBlockHeaderInput};
+    use hotshot_builder_api::v0_1::block_info::{AvailableBlockData, AvailableBlockHeaderInputV2};
     pub use hotshot_builder_api::v0_1::Version;
     use hotshot_types::{
         constants::LEGACY_BUILDER_MODULE,
@@ -157,11 +154,11 @@ pub mod v0_1 {
             view_number: u64,
             sender: TYPES::SignatureKey,
             signature: &<<TYPES as NodeType>::SignatureKey as SignatureKey>::PureAssembledSignatureType,
-        ) -> Result<AvailableBlockHeaderInput<TYPES>, BuilderClientError> {
+        ) -> Result<AvailableBlockHeaderInputV2<TYPES>, BuilderClientError> {
             let encoded_signature: TaggedBase64 = signature.clone().into();
             self.client
                 .get(&format!(
-                    "{LEGACY_BUILDER_MODULE}/claimheaderinput/{block_hash}/{view_number}/{sender}/{encoded_signature}"
+                    "{LEGACY_BUILDER_MODULE}/claimheaderinput/v2/{block_hash}/{view_number}/{sender}/{encoded_signature}"
                 ))
                 .send()
                 .await
@@ -230,8 +227,8 @@ pub mod v0_2 {
 pub mod v0_99 {
     pub use hotshot_builder_api::v0_99::Version;
     use hotshot_types::{
-        bundle::Bundle, constants::MARKETPLACE_BUILDER_MODULE,
-        traits::node_implementation::NodeType, vid::VidCommitment,
+        bundle::Bundle, constants::MARKETPLACE_BUILDER_MODULE, data::VidCommitment,
+        traits::node_implementation::NodeType,
     };
     use vbs::version::StaticVersion;
 

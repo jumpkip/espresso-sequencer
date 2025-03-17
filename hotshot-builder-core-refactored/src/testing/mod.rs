@@ -2,26 +2,30 @@
 #![allow(clippy::declare_interior_mutable_const)]
 #![allow(clippy::borrow_interior_mutable_const)]
 
-use std::cell::LazyCell;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{cell::LazyCell, sync::Arc, time::Duration};
 
 use async_broadcast::Sender;
 use committable::Commitment;
-use hotshot::rand::{thread_rng, Rng};
-use hotshot::types::{BLSPubKey, Event, EventType, SignatureKey};
-use hotshot_builder_api::v0_1::block_info::AvailableBlockHeaderInput;
-use hotshot_builder_api::v0_1::builder::BuildError;
-use hotshot_builder_api::v0_1::data_source::AcceptsTxnSubmits;
-use hotshot_builder_api::v0_1::{block_info::AvailableBlockInfo, data_source::BuilderDataSource};
-use hotshot_example_types::block_types::TestTransaction;
-use hotshot_example_types::node_types::{TestTypes, TestVersions};
+use hotshot::{
+    rand::{thread_rng, Rng},
+    types::{BLSPubKey, Event, EventType, SignatureKey},
+};
+use hotshot_builder_api::v0_1::{
+    block_info::{AvailableBlockHeaderInputV1, AvailableBlockInfo},
+    builder::BuildError,
+    data_source::{AcceptsTxnSubmits, BuilderDataSource},
+};
+use hotshot_example_types::{block_types::TestTransaction, node_types::TestTypes};
 use hotshot_task_impls::builder::v0_1::BuilderClient;
-use hotshot_types::data::ViewNumber;
-use hotshot_types::traits::node_implementation::{ConsensusTime, NodeType};
-use marketplace_builder_shared::block::{BlockId, BuilderStateId};
-use marketplace_builder_shared::error::Error;
-use marketplace_builder_shared::utils::BuilderKeys;
+use hotshot_types::{
+    data::ViewNumber,
+    traits::node_implementation::{ConsensusTime, NodeType},
+};
+use marketplace_builder_shared::{
+    block::{BlockId, BuilderStateId},
+    error::Error,
+    utils::BuilderKeys,
+};
 use tokio::spawn;
 use url::Url;
 use vbs::version::StaticVersion;
@@ -71,9 +75,7 @@ impl TestServiceWrapper {
     ) -> Self {
         let port = portpicker::pick_unused_port().unwrap();
         let url: Url = format!("http://localhost:{port}").parse().unwrap();
-        let app = Arc::clone(&global_state)
-            .into_app::<TestVersions>()
-            .unwrap();
+        let app = Arc::clone(&global_state).into_app().unwrap();
         spawn(app.serve(url.clone(), StaticVersion::<0, 1> {}));
         let client = BuilderClient::new(url);
         assert!(client.connect(Duration::from_secs(1)).await);
@@ -93,7 +95,7 @@ impl TestServiceWrapper {
         state_id: &BuilderStateId<TestTypes>,
     ) -> Result<Vec<AvailableBlockInfo<TestTypes>>, BuildError> {
         self.proxy_global_state
-            .available_blocks::<TestVersions>(
+            .available_blocks(
                 &state_id.parent_commitment,
                 *state_id.parent_view,
                 MOCK_LEADER_KEYS.0,
@@ -107,7 +109,7 @@ impl TestServiceWrapper {
     pub(crate) async fn claim_block_header_input(
         &self,
         block_id: &BlockId<TestTypes>,
-    ) -> Result<AvailableBlockHeaderInput<TestTypes>, BuildError> {
+    ) -> Result<AvailableBlockHeaderInputV1<TestTypes>, BuildError> {
         self.proxy_global_state
             .claim_block_header_input(
                 &block_id.hash,
@@ -131,7 +133,7 @@ impl TestServiceWrapper {
     ) -> Vec<TestTransaction> {
         let mut available_states = self
             .client
-            .available_blocks::<TestVersions>(
+            .available_blocks(
                 state_id.parent_commitment,
                 *state_id.parent_view,
                 MOCK_LEADER_KEYS.0,

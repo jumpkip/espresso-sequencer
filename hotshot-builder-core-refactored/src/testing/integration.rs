@@ -5,7 +5,6 @@ use std::{collections::HashMap, fmt::Display, marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
 use hotshot::types::SignatureKey;
-use hotshot_example_types::node_types::TestVersions;
 use hotshot_testing::{
     block_builder::{BuilderTask, TestBuilderImplementation},
     test_builder::BuilderChange,
@@ -73,7 +72,7 @@ where
 
         // Create tide-disco app based on global state
         let app = Arc::clone(&service)
-            .into_app::<TestVersions>()
+            .into_app()
             .expect("Failed to create builder tide-disco app");
 
         let url_clone = url.clone();
@@ -119,21 +118,20 @@ where
 mod tests {
     use std::time::Duration;
 
-    use crate::testing::integration::LegacyBuilderImpl;
-    use marketplace_builder_shared::testing::{
-        generation::{self, TransactionGenerationConfig},
-        run_test,
-        validation::BuilderValidationConfig,
-    };
-
-    use hotshot_example_types::node_types::TestVersions;
-    use hotshot_example_types::node_types::{MemoryImpl, TestTypes};
+    use hotshot_example_types::node_types::{MemoryImpl, TestTypes, TestVersions};
     use hotshot_macros::cross_tests;
     use hotshot_testing::{
         completion_task::{CompletionTaskDescription, TimeBasedCompletionTaskDescription},
         overall_safety_task::OverallSafetyPropertiesDescription,
         test_builder::TestDescription,
     };
+    use marketplace_builder_shared::testing::{
+        generation::{self, TransactionGenerationConfig},
+        run_test,
+        validation::BuilderValidationConfig,
+    };
+
+    use crate::testing::integration::LegacyBuilderImpl;
 
     #[tokio::test(flavor = "multi_thread")]
     #[tracing::instrument]
@@ -153,7 +151,6 @@ mod tests {
             ),
             overall_safety_properties: OverallSafetyPropertiesDescription {
                 num_successful_views,
-                num_failed_views: 5,
                 ..Default::default()
             },
             ..TestDescription::default()
@@ -197,7 +194,6 @@ mod tests {
                 ),
                 overall_safety_properties: OverallSafetyPropertiesDescription {
                     num_successful_views: 50,
-                    num_failed_views: 5,
                     ..Default::default()
                 },
                 ..Default::default()

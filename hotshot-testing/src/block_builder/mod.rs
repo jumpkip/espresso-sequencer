@@ -4,32 +4,31 @@
 // You should have received a copy of the MIT License
 // along with the HotShot repository. If not, see <https://mit-license.org/>.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use async_broadcast::Receiver;
-use async_lock::RwLock;
 use async_trait::async_trait;
 use futures::Stream;
 use hotshot::{traits::BlockPayload, types::Event};
 use hotshot_builder_api::{
-    v0_1,
     v0_1::{
-        block_info::{AvailableBlockData, AvailableBlockHeaderInput, AvailableBlockInfo},
+        self,
+        block_info::{AvailableBlockData, AvailableBlockInfo},
         builder::{Error, Options},
     },
+    v0_2::block_info::AvailableBlockHeaderInputV1,
     v0_99,
 };
 use hotshot_types::{
     constants::{LEGACY_BUILDER_MODULE, MARKETPLACE_BUILDER_MODULE},
     traits::{
-        block_contents::EncodeBytes,
-        node_implementation::{NodeType, Versions},
+        block_contents::EncodeBytes, node_implementation::NodeType,
         signature_key::BuilderSignatureKey,
     },
 };
 use tide_disco::{method::ReadState, App, Url};
 use tokio::spawn;
-use vbs::version::{StaticVersionType, Version};
+use vbs::version::StaticVersionType;
 
 use crate::test_builder::BuilderChange;
 
@@ -66,14 +65,14 @@ pub trait BuilderTask<TYPES: NodeType>: Send + Sync {
 struct BlockEntry<TYPES: NodeType> {
     metadata: AvailableBlockInfo<TYPES>,
     payload: Option<AvailableBlockData<TYPES>>,
-    header_input: Option<AvailableBlockHeaderInput<TYPES>>,
+    header_input: Option<AvailableBlockHeaderInputV1<TYPES>>,
 }
 
 /// Construct a tide disco app that mocks the builder API 0.1 + 0.3.
 ///
 /// # Panics
 /// If constructing and launching the builder fails for any reason
-pub fn run_builder_source<TYPES, Source, V: Versions>(
+pub fn run_builder_source<TYPES, Source>(
     url: Url,
     mut change_receiver: Receiver<BuilderChange>,
     source: Source,
@@ -88,11 +87,10 @@ pub fn run_builder_source<TYPES, Source, V: Versions>(
 {
     spawn(async move {
         let start_builder = |url: Url, source: Source| -> _ {
-            let builder_api_0_1 =
-                hotshot_builder_api::v0_1::builder::define_api::<Source, TYPES, V>(
-                    &Options::default(),
-                )
-                .expect("Failed to construct the builder API");
+            let builder_api_0_1 = hotshot_builder_api::v0_1::builder::define_api::<Source, TYPES>(
+                &Options::default(),
+            )
+            .expect("Failed to construct the builder API");
             let builder_api_0_3 = hotshot_builder_api::v0_99::builder::define_api::<Source, TYPES>(
                 &Options::default(),
             )
@@ -111,13 +109,13 @@ pub fn run_builder_source<TYPES, Source, V: Versions>(
             match event {
                 BuilderChange::Up if handle.is_none() => {
                     handle = Some(start_builder(url.clone(), source.clone()));
-                }
+                },
                 BuilderChange::Down => {
                     if let Some(handle) = handle.take() {
                         handle.abort();
                     }
-                }
-                _ => {}
+                },
+                _ => {},
             }
         }
     });
@@ -127,7 +125,7 @@ pub fn run_builder_source<TYPES, Source, V: Versions>(
 ///
 /// # Panics
 /// If constructing and launching the builder fails for any reason
-pub fn run_builder_source_0_1<TYPES, Source, V: Versions>(
+pub fn run_builder_source_0_1<TYPES, Source>(
     url: Url,
     mut change_receiver: Receiver<BuilderChange>,
     source: Source,
@@ -139,7 +137,7 @@ pub fn run_builder_source_0_1<TYPES, Source, V: Versions>(
 {
     spawn(async move {
         let start_builder = |url: Url, source: Source| -> _ {
-            let builder_api = hotshot_builder_api::v0_1::builder::define_api::<Source, TYPES, V>(
+            let builder_api = hotshot_builder_api::v0_1::builder::define_api::<Source, TYPES>(
                 &Options::default(),
             )
             .expect("Failed to construct the builder API");
@@ -155,25 +153,23 @@ pub fn run_builder_source_0_1<TYPES, Source, V: Versions>(
             match event {
                 BuilderChange::Up if handle.is_none() => {
                     handle = Some(start_builder(url.clone(), source.clone()));
-                }
+                },
                 BuilderChange::Down => {
                     if let Some(handle) = handle.take() {
                         handle.abort();
                     }
-                }
-                _ => {}
+                },
+                _ => {},
             }
         }
     });
 }
 
 /// Helper function to construct all builder data structures from a list of transactions
-async fn build_block<TYPES: NodeType, V: Versions>(
+async fn build_block<TYPES: NodeType>(
     transactions: Vec<TYPES::Transaction>,
-    num_storage_nodes: Arc<RwLock<usize>>,
     pub_key: TYPES::BuilderSignatureKey,
     priv_key: <TYPES::BuilderSignatureKey as BuilderSignatureKey>::BuilderPrivateKey,
-    version: Version,
 ) -> BlockEntry<TYPES>
 where
     <TYPES as NodeType>::InstanceState: Default,
@@ -188,12 +184,6 @@ where
 
     let commitment = block_payload.builder_commitment(&metadata);
 
-    let vid_commitment = hotshot_types::traits::block_contents::vid_commitment::<V>(
-        &block_payload.encode(),
-        *num_storage_nodes.read_arc().await,
-        version,
-    );
-
     // Get block size from the encoded payload
     let block_size = block_payload.encode().len() as u64;
 
@@ -205,12 +195,8 @@ where
         TYPES::BuilderSignatureKey::sign_builder_message(&priv_key, commitment.as_ref())
             .expect("Failed to sign commitment");
 
-    let signature_over_vid_commitment =
-        TYPES::BuilderSignatureKey::sign_builder_message(&priv_key, vid_commitment.as_ref())
-            .expect("Failed to sign block vid commitment");
-
     let signature_over_fee_info =
-        TYPES::BuilderSignatureKey::sign_fee(&priv_key, 123_u64, &metadata, &vid_commitment)
+        TYPES::BuilderSignatureKey::sign_fee(&priv_key, 123_u64, &metadata)
             .expect("Failed to sign fee info");
 
     let block = AvailableBlockData {
@@ -227,9 +213,7 @@ where
         offered_fee: 123,
         _phantom: std::marker::PhantomData,
     };
-    let header_input = AvailableBlockHeaderInput {
-        vid_commitment,
-        message_signature: signature_over_vid_commitment.clone(),
+    let header_input = AvailableBlockHeaderInputV1 {
         fee_signature: signature_over_fee_info,
         sender: pub_key,
     };

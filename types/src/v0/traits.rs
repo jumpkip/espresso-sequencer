@@ -4,41 +4,65 @@ use std::{cmp::max, collections::BTreeMap, fmt::Debug, ops::Range, sync::Arc};
 
 use anyhow::{bail, ensure, Context};
 use async_trait::async_trait;
-use committable::{Commitment, Committable};
+use committable::Commitment;
 use futures::{FutureExt, TryFutureExt};
-use hotshot::{types::EventType, HotShotInitializer};
+use hotshot::{types::EventType, HotShotInitializer, InitializerEpochInfo};
 use hotshot_types::{
-    consensus::CommitmentMap,
     data::{
-        vid_disperse::ADVZDisperseShare, DaProposal, EpochNumber, QuorumProposal, QuorumProposal2,
-        QuorumProposalWrapper, ViewNumber,
+        vid_disperse::{ADVZDisperseShare, VidDisperseShare2},
+        DaProposal, DaProposal2, EpochNumber, QuorumProposal, QuorumProposal2,
+        QuorumProposalWrapper, VidCommitment, VidDisperseShare, ViewNumber,
     },
+    drb::DrbResult,
     event::{HotShotAction, LeafInfo},
-    message::{convert_proposal, Proposal},
+    message::{convert_proposal, Proposal, UpgradeLock},
     simple_certificate::{
         NextEpochQuorumCertificate2, QuorumCertificate, QuorumCertificate2, UpgradeCertificate,
     },
     traits::{
-        node_implementation::{ConsensusTime, Versions},
+        node_implementation::{ConsensusTime, NodeType, Versions},
         storage::Storage,
         ValidatedState as HotShotState,
     },
-    utils::{genesis_epoch_from_version, View},
-    vid::VidSchemeType,
+    utils::{genesis_epoch_from_version, verify_epoch_root_chain},
 };
 use itertools::Itertools;
-use jf_vid::VidScheme;
 use serde::{de::DeserializeOwned, Serialize};
 
+use super::{
+    impls::NodeState, utils::BackoffParams, v0_3::StakeTables, EpochCommittees, EpochVersion,
+    SequencerVersions,
+};
 use crate::{
     v0::impls::ValidatedState, v0_99::ChainConfig, BlockMerkleTree, Event, FeeAccount,
     FeeAccountProof, FeeMerkleCommitment, FeeMerkleTree, Leaf2, NetworkConfig, SeqTypes,
 };
 
-use super::{impls::NodeState, utils::BackoffParams, Leaf};
-
 #[async_trait]
 pub trait StateCatchup: Send + Sync {
+    async fn try_fetch_leaves(&self, retry: usize, height: u64) -> anyhow::Result<Vec<Leaf2>>;
+
+    async fn fetch_leaf(
+        &self,
+        height: u64,
+        membership: &EpochCommittees,
+        epoch: EpochNumber,
+        epoch_height: u64,
+    ) -> anyhow::Result<Leaf2> {
+        self.backoff().retry(
+            self, |provider, retry| {
+                async move {
+                    let chain = provider.try_fetch_leaves(retry, height).await?;
+                    verify_epoch_root_chain(
+                        chain,
+                        membership,
+                        epoch,
+                        epoch_height,
+                        &UpgradeLock::<SeqTypes, SequencerVersions<EpochVersion, EpochVersion>>::new()).await
+                }.boxed()
+            }).await
+    }
+
     /// Try to fetch the given accounts state, failing without retrying if unable.
     async fn try_fetch_accounts(
         &self,
@@ -145,6 +169,21 @@ pub trait StateCatchup: Send + Sync {
 
 #[async_trait]
 impl<T: StateCatchup + ?Sized> StateCatchup for Box<T> {
+    async fn try_fetch_leaves(&self, retry: usize, height: u64) -> anyhow::Result<Vec<Leaf2>> {
+        (**self).try_fetch_leaves(retry, height).await
+    }
+
+    async fn fetch_leaf(
+        &self,
+        height: u64,
+        membership: &EpochCommittees,
+        epoch: EpochNumber,
+        epoch_height: u64,
+    ) -> anyhow::Result<Leaf2> {
+        (**self)
+            .fetch_leaf(height, membership, epoch, epoch_height)
+            .await
+    }
     async fn try_fetch_accounts(
         &self,
         retry: usize,
@@ -230,6 +269,21 @@ impl<T: StateCatchup + ?Sized> StateCatchup for Box<T> {
 
 #[async_trait]
 impl<T: StateCatchup + ?Sized> StateCatchup for Arc<T> {
+    async fn try_fetch_leaves(&self, retry: usize, height: u64) -> anyhow::Result<Vec<Leaf2>> {
+        (**self).try_fetch_leaves(retry, height).await
+    }
+
+    async fn fetch_leaf(
+        &self,
+        height: u64,
+        membership: &EpochCommittees,
+        epoch: EpochNumber,
+        epoch_height: u64,
+    ) -> anyhow::Result<Leaf2> {
+        (**self)
+            .fetch_leaf(height, membership, epoch, epoch_height)
+            .await
+    }
     async fn try_fetch_accounts(
         &self,
         retry: usize,
@@ -316,6 +370,21 @@ impl<T: StateCatchup + ?Sized> StateCatchup for Arc<T> {
 /// Catchup from multiple providers tries each provider in a round robin fashion until it succeeds.
 #[async_trait]
 impl<T: StateCatchup> StateCatchup for Vec<T> {
+    async fn try_fetch_leaves(&self, retry: usize, height: u64) -> anyhow::Result<Vec<Leaf2>> {
+        for provider in self {
+            match provider.try_fetch_leaves(retry, height).await {
+                Ok(leaves) => return Ok(leaves),
+                Err(err) => {
+                    tracing::info!(
+                        provider = provider.name(),
+                        "failed to fetch leaves: {err:#}"
+                    );
+                },
+            }
+        }
+
+        bail!("could not fetch leaves from any provider");
+    }
     #[tracing::instrument(skip(self, instance))]
     async fn try_fetch_accounts(
         &self,
@@ -345,7 +414,7 @@ impl<T: StateCatchup> StateCatchup for Vec<T> {
                         provider = provider.name(),
                         "failed to fetch accounts: {err:#}"
                     );
-                }
+                },
             }
         }
 
@@ -372,7 +441,7 @@ impl<T: StateCatchup> StateCatchup for Vec<T> {
                         provider = provider.name(),
                         "failed to fetch frontier: {err:#}"
                     );
-                }
+                },
             }
         }
 
@@ -392,7 +461,7 @@ impl<T: StateCatchup> StateCatchup for Vec<T> {
                         provider = provider.name(),
                         "failed to fetch chain config: {err:#}"
                     );
-                }
+                },
             }
         }
 
@@ -443,11 +512,6 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
     /// Load the highest view saved with [`save_voted_view`](Self::save_voted_view).
     async fn load_latest_acted_view(&self) -> anyhow::Result<Option<ViewNumber>>;
 
-    /// Load undecided state saved by consensus before we shut down.
-    async fn load_undecided_state(
-        &self,
-    ) -> anyhow::Result<Option<(CommitmentMap<Leaf2>, BTreeMap<ViewNumber, View<SeqTypes>>)>>;
-
     /// Load the proposals saved by consensus
     async fn load_quorum_proposals(
         &self,
@@ -461,14 +525,17 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
     async fn load_vid_share(
         &self,
         view: ViewNumber,
-    ) -> anyhow::Result<Option<Proposal<SeqTypes, ADVZDisperseShare<SeqTypes>>>>;
+    ) -> anyhow::Result<Option<Proposal<SeqTypes, VidDisperseShare<SeqTypes>>>>;
     async fn load_da_proposal(
         &self,
         view: ViewNumber,
-    ) -> anyhow::Result<Option<Proposal<SeqTypes, DaProposal<SeqTypes>>>>;
+    ) -> anyhow::Result<Option<Proposal<SeqTypes, DaProposal2<SeqTypes>>>>;
     async fn load_upgrade_certificate(
         &self,
     ) -> anyhow::Result<Option<UpgradeCertificate<SeqTypes>>>;
+    async fn load_start_epoch_info(&self) -> anyhow::Result<Vec<InitializerEpochInfo<SeqTypes>>>;
+    async fn load_stake(&self, epoch: EpochNumber) -> anyhow::Result<Option<StakeTables>>;
+    async fn store_stake(&self, epoch: EpochNumber, stake: StakeTables) -> anyhow::Result<()>;
 
     /// Load the latest known consensus state.
     ///
@@ -489,11 +556,11 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
             Some(view) => {
                 tracing::info!(?view, "starting from saved view");
                 view
-            }
+            },
             None => {
                 tracing::info!("no saved view, starting from genesis");
                 ViewNumber::genesis()
-            }
+            },
         };
 
         let next_epoch_high_qc = self
@@ -518,19 +585,16 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
 
                 let anchor_view = leaf.view_number();
                 (leaf, high_qc, Some(anchor_view))
-            }
+            },
             None => {
                 tracing::info!("no saved leaf, starting from genesis leaf");
                 (
-                    hotshot_types::data::Leaf::genesis::<V>(&genesis_validated_state, &state)
-                        .await
-                        .into(),
-                    QuorumCertificate::genesis::<V>(&genesis_validated_state, &state)
-                        .await
-                        .to_qc2(),
+                    hotshot_types::data::Leaf2::genesis::<V>(&genesis_validated_state, &state)
+                        .await,
+                    QuorumCertificate2::genesis::<V>(&genesis_validated_state, &state).await,
                     None,
                 )
-            }
+            },
         };
         let validated_state = if leaf.block_header().height() == 0 {
             // If we are starting from genesis, we can provide the full state.
@@ -549,10 +613,14 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
         // TODO:
         let epoch = genesis_epoch_from_version::<V, SeqTypes>();
 
-        let (undecided_leaves, undecided_state) = self
-            .load_undecided_state()
-            .await
-            .context("loading undecided state")?
+        let config = self.load_config().await.context("loading config")?;
+        let epoch_height = config
+            .as_ref()
+            .map(|c| c.config.epoch_height)
+            .unwrap_or_default();
+        let epoch_start_block = config
+            .as_ref()
+            .map(|c| c.config.epoch_start_block)
             .unwrap_or_default();
 
         let saved_proposals = self
@@ -565,23 +633,25 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
             .await
             .context("loading upgrade certificate")?;
 
+        let start_epoch_info = self
+            .load_start_epoch_info()
+            .await
+            .context("loading start epoch info")?;
+
         tracing::info!(
             ?leaf,
             ?view,
             ?epoch,
             ?high_qc,
             ?validated_state,
-            ?undecided_leaves,
-            ?undecided_state,
-            ?saved_proposals,
-            ?upgrade_certificate,
             "loaded consensus state"
         );
 
         Ok((
             HotShotInitializer {
                 instance_state: state,
-                epoch_height: 0,
+                epoch_height,
+                epoch_start_block,
                 anchor_leaf: leaf,
                 anchor_state: validated_state.unwrap_or_default(),
                 anchor_state_delta: None,
@@ -592,12 +662,10 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
                 high_qc,
                 next_epoch_high_qc,
                 decided_upgrade_certificate: upgrade_certificate,
-                undecided_leaves: undecided_leaves
-                    .into_values()
-                    .map(|e| (e.view_number(), e))
-                    .collect(),
-                undecided_state,
+                undecided_leaves: Default::default(),
+                undecided_state: Default::default(),
                 saved_vid_shares: Default::default(), // TODO: implement saved_vid_shares
+                start_epoch_info,
             },
             anchor_view,
         ))
@@ -671,10 +739,15 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
         &self,
         proposal: &Proposal<SeqTypes, ADVZDisperseShare<SeqTypes>>,
     ) -> anyhow::Result<()>;
+    // TODO: merge these two `append_vid`s
+    async fn append_vid2(
+        &self,
+        proposal: &Proposal<SeqTypes, VidDisperseShare2<SeqTypes>>,
+    ) -> anyhow::Result<()>;
     async fn append_da(
         &self,
         proposal: &Proposal<SeqTypes, DaProposal<SeqTypes>>,
-        vid_commit: <VidSchemeType as VidScheme>::Commit,
+        vid_commit: VidCommitment,
     ) -> anyhow::Result<()>;
     async fn record_action(
         &self,
@@ -682,12 +755,8 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
         epoch: Option<EpochNumber>,
         action: HotShotAction,
     ) -> anyhow::Result<()>;
-    async fn update_undecided_state(
-        &self,
-        leaves: CommitmentMap<Leaf2>,
-        state: BTreeMap<ViewNumber, View<SeqTypes>>,
-    ) -> anyhow::Result<()>;
-    async fn append_quorum_proposal(
+
+    async fn append_quorum_proposal2(
         &self,
         proposal: &Proposal<SeqTypes, QuorumProposalWrapper<SeqTypes>>,
     ) -> anyhow::Result<()>;
@@ -695,13 +764,25 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
         &self,
         decided_upgrade_certificate: Option<UpgradeCertificate<SeqTypes>>,
     ) -> anyhow::Result<()>;
-    async fn migrate_consensus(
-        &self,
-        migrate_leaf: fn(Leaf) -> Leaf2,
-        migrate_proposal: fn(
-            Proposal<SeqTypes, QuorumProposal<SeqTypes>>,
-        ) -> Proposal<SeqTypes, QuorumProposal2<SeqTypes>>,
-    ) -> anyhow::Result<()>;
+    async fn migrate_consensus(&self) -> anyhow::Result<()> {
+        tracing::warn!("migrating consensus data...");
+
+        self.migrate_anchor_leaf().await?;
+        self.migrate_da_proposals().await?;
+        self.migrate_vid_shares().await?;
+        self.migrate_quorum_proposals().await?;
+        self.migrate_quorum_certificates().await?;
+
+        tracing::warn!("consensus storage has been migrated to new types");
+
+        Ok(())
+    }
+
+    async fn migrate_anchor_leaf(&self) -> anyhow::Result<()>;
+    async fn migrate_da_proposals(&self) -> anyhow::Result<()>;
+    async fn migrate_vid_shares(&self) -> anyhow::Result<()>;
+    async fn migrate_quorum_proposals(&self) -> anyhow::Result<()>;
+    async fn migrate_quorum_certificates(&self) -> anyhow::Result<()>;
 
     async fn load_anchor_view(&self) -> anyhow::Result<ViewNumber> {
         match self.load_anchor_leaf().await? {
@@ -718,6 +799,30 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
     async fn load_next_epoch_quorum_certificate(
         &self,
     ) -> anyhow::Result<Option<NextEpochQuorumCertificate2<SeqTypes>>>;
+
+    async fn append_da2(
+        &self,
+        proposal: &Proposal<SeqTypes, DaProposal2<SeqTypes>>,
+        vid_commit: VidCommitment,
+    ) -> anyhow::Result<()>;
+
+    async fn append_proposal2(
+        &self,
+        proposal: &Proposal<SeqTypes, QuorumProposalWrapper<SeqTypes>>,
+    ) -> anyhow::Result<()> {
+        self.append_quorum_proposal2(proposal).await
+    }
+
+    async fn add_drb_result(
+        &self,
+        epoch: <SeqTypes as NodeType>::Epoch,
+        drb_result: DrbResult,
+    ) -> anyhow::Result<()>;
+    async fn add_epoch_root(
+        &self,
+        epoch: <SeqTypes as NodeType>::Epoch,
+        block_header: <SeqTypes as NodeType>::BlockHeader,
+    ) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -754,12 +859,27 @@ impl<P: SequencerPersistence> Storage<SeqTypes> for Arc<P> {
         (**self).append_vid(proposal).await
     }
 
+    async fn append_vid2(
+        &self,
+        proposal: &Proposal<SeqTypes, VidDisperseShare2<SeqTypes>>,
+    ) -> anyhow::Result<()> {
+        (**self).append_vid2(proposal).await
+    }
+
     async fn append_da(
         &self,
         proposal: &Proposal<SeqTypes, DaProposal<SeqTypes>>,
-        vid_commit: <VidSchemeType as VidScheme>::Commit,
+        vid_commit: VidCommitment,
     ) -> anyhow::Result<()> {
         (**self).append_da(proposal, vid_commit).await
+    }
+
+    async fn append_da2(
+        &self,
+        proposal: &Proposal<SeqTypes, DaProposal2<SeqTypes>>,
+        vid_commit: VidCommitment,
+    ) -> anyhow::Result<()> {
+        (**self).append_da2(proposal, vid_commit).await
     }
 
     async fn record_action(
@@ -775,32 +895,26 @@ impl<P: SequencerPersistence> Storage<SeqTypes> for Arc<P> {
         Ok(())
     }
 
-    async fn update_undecided_state(
-        &self,
-        leaves: CommitmentMap<Leaf>,
-        state: BTreeMap<ViewNumber, View<SeqTypes>>,
-    ) -> anyhow::Result<()> {
-        (**self)
-            .update_undecided_state(
-                leaves
-                    .into_values()
-                    .map(|leaf| {
-                        let leaf2: Leaf2 = leaf.into();
-                        (leaf2.commit(), leaf2)
-                    })
-                    .collect(),
-                state,
-            )
-            .await
-    }
-
     async fn append_proposal(
         &self,
         proposal: &Proposal<SeqTypes, QuorumProposal<SeqTypes>>,
     ) -> anyhow::Result<()> {
         (**self)
-            .append_quorum_proposal(&convert_proposal(proposal.clone()))
+            .append_quorum_proposal2(&convert_proposal(proposal.clone()))
             .await
+    }
+
+    async fn append_proposal2(
+        &self,
+        proposal: &Proposal<SeqTypes, QuorumProposal2<SeqTypes>>,
+    ) -> anyhow::Result<()> {
+        let proposal_qp_wrapper: Proposal<SeqTypes, QuorumProposalWrapper<SeqTypes>> =
+            convert_proposal(proposal.clone());
+        (**self).append_quorum_proposal2(&proposal_qp_wrapper).await
+    }
+
+    async fn update_high_qc2(&self, _high_qc: QuorumCertificate2<SeqTypes>) -> anyhow::Result<()> {
+        Ok(())
     }
 
     async fn update_decided_upgrade_certificate(
@@ -810,6 +924,22 @@ impl<P: SequencerPersistence> Storage<SeqTypes> for Arc<P> {
         (**self)
             .store_upgrade_certificate(decided_upgrade_certificate)
             .await
+    }
+
+    async fn add_drb_result(
+        &self,
+        epoch: <SeqTypes as NodeType>::Epoch,
+        drb_result: DrbResult,
+    ) -> anyhow::Result<()> {
+        (**self).add_drb_result(epoch, drb_result).await
+    }
+
+    async fn add_epoch_root(
+        &self,
+        epoch: <SeqTypes as NodeType>::Epoch,
+        block_header: <SeqTypes as NodeType>::BlockHeader,
+    ) -> anyhow::Result<()> {
+        (**self).add_epoch_root(epoch, block_header).await
     }
 }
 

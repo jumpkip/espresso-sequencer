@@ -118,21 +118,20 @@ where
 mod tests {
     use std::time::Duration;
 
-    use crate::testing::integration::MarketplaceBuilderImpl;
-    use marketplace_builder_shared::testing::{
-        generation::{self, TransactionGenerationConfig},
-        run_test,
-        validation::BuilderValidationConfig,
-    };
-
-    use hotshot_example_types::node_types::MarketplaceTestVersions;
-    use hotshot_example_types::node_types::{MemoryImpl, TestTypes};
+    use hotshot_example_types::node_types::{MarketplaceTestVersions, MemoryImpl, TestTypes};
     use hotshot_macros::cross_tests;
     use hotshot_testing::{
         completion_task::{CompletionTaskDescription, TimeBasedCompletionTaskDescription},
         overall_safety_task::OverallSafetyPropertiesDescription,
         test_builder::TestDescription,
     };
+    use marketplace_builder_shared::testing::{
+        generation::{self, TransactionGenerationConfig},
+        run_test,
+        validation::BuilderValidationConfig,
+    };
+
+    use crate::testing::integration::MarketplaceBuilderImpl;
 
     #[tokio::test(flavor = "multi_thread")]
     #[tracing::instrument]
@@ -149,7 +148,6 @@ mod tests {
             ),
             overall_safety_properties: OverallSafetyPropertiesDescription {
                 num_successful_views,
-                num_failed_views: 5,
                 ..Default::default()
             },
             ..TestDescription::default()
@@ -193,7 +191,6 @@ mod tests {
                 ),
                 overall_safety_properties: OverallSafetyPropertiesDescription {
                     num_successful_views: 50,
-                    num_failed_views: 5,
                     ..Default::default()
                 },
                 ..Default::default()

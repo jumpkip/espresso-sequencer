@@ -3,7 +3,6 @@ use hotshot_builder_api::v0_1::builder::{
     Error as BuilderApiError, Options as HotshotBuilderApiOptions,
 };
 use hotshot_builder_core::service::ProxyGlobalState;
-use hotshot_types::traits::node_implementation::Versions;
 use sequencer::SequencerApiVersion;
 use tide_disco::{App, Url};
 use tokio::spawn;
@@ -12,13 +11,13 @@ use vbs::version::{StaticVersion, StaticVersionType};
 pub mod non_permissioned;
 
 // It runs the api service for the builder
-pub fn run_builder_api_service<V: Versions>(url: Url, source: ProxyGlobalState<SeqTypes>) {
+pub fn run_builder_api_service(url: Url, source: ProxyGlobalState<SeqTypes>) {
     // it is to serve hotshot
-    let builder_api =
-        hotshot_builder_api::v0_1::builder::define_api::<ProxyGlobalState<SeqTypes>, SeqTypes, V>(
-            &HotshotBuilderApiOptions::default(),
-        )
-        .expect("Failed to construct the builder APIs");
+    let builder_api = hotshot_builder_api::v0_1::builder::define_api::<
+        ProxyGlobalState<SeqTypes>,
+        SeqTypes,
+    >(&HotshotBuilderApiOptions::default())
+    .expect("Failed to construct the builder APIs");
 
     // it enables external clients to submit txn to the builder's private mempool
     let private_mempool_api = hotshot_builder_api::v0_1::builder::submit_api::<
@@ -41,6 +40,12 @@ pub fn run_builder_api_service<V: Versions>(url: Url, source: ProxyGlobalState<S
 
 #[cfg(test)]
 pub mod testing {
+    use std::{
+        num::NonZeroUsize,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
     use async_lock::RwLock;
     use committable::Committable;
     use espresso_types::{
@@ -58,7 +63,7 @@ pub mod testing {
         },
     };
     use hotshot_builder_api::v0_2::block_info::{
-        AvailableBlockData, AvailableBlockHeaderInput, AvailableBlockInfo,
+        AvailableBlockData, AvailableBlockHeaderInputV1, AvailableBlockInfo,
     };
     use hotshot_events_service::{
         events::{Error as EventStreamApiError, Options as EventStreamingApiOptions},
@@ -75,18 +80,13 @@ pub mod testing {
         },
         HotShotConfig, PeerConfig, ValidatorConfig,
     };
+    use jf_signature::bls_over_bn254::VerKey;
     use sequencer::{context::Consensus, network, SequencerApiVersion};
-    use std::{
-        num::NonZeroUsize,
-        sync::Arc,
-        time::{Duration, Instant},
-    };
     use surf_disco::Client;
     use vbs::version::StaticVersion;
 
     use super::*;
     use crate::non_permissioned::BuilderConfig;
-    use jf_signature::bls_over_bn254::VerKey;
 
     #[derive(Clone)]
     pub struct HotShotTestConfig {
@@ -140,6 +140,7 @@ pub mod testing {
                 stop_proposing_time: 0,
                 stop_voting_time: 0,
                 epoch_height: 0,
+                epoch_start_block: 0,
             };
 
             Self {
@@ -414,10 +415,10 @@ pub mod testing {
         {
             Ok(response) => {
                 tracing::info!("Received txn submitted response : {:?}", response);
-            }
+            },
             Err(e) => {
                 panic!("Error submitting private transaction {:?}", e);
-            }
+            },
         }
 
         let seed = [207_u8; 32];
@@ -490,7 +491,7 @@ pub mod testing {
 
         // Test claiming block header input
         let _available_block_header = match builder_client
-                .get::<AvailableBlockHeaderInput<SeqTypes>>(&format!(
+                .get::<AvailableBlockHeaderInputV1<SeqTypes>>(&format!(
                     "block_info/claimheaderinput/{builder_commitment}/{view_num}/{hotshot_client_pub_key}/{encoded_signature}"
                 ))
                 .send()
@@ -514,10 +515,10 @@ pub mod testing {
             Ok(response) => {
                 tracing::info!("Received Builder Key : {:?}", response);
                 assert_eq!(response, builder_pub_key);
-            }
+            },
             Err(e) => {
                 panic!("Error getting builder key {:?}", e);
-            }
+            },
         }
     }
 }

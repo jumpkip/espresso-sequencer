@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use super::TransactionPayload;
-
+use anyhow::{bail, Error};
 use async_lock::RwLock;
+use async_trait::async_trait;
+use chrono::{DateTime, Local};
 use hotshot::{
     traits::{BlockPayload, TestableNodeImplementation},
     types::{Event, EventType},
@@ -17,9 +18,7 @@ use hotshot_types::traits::{
     node_implementation::{NodeType, Versions},
 };
 
-use anyhow::bail;
-use async_trait::async_trait;
-use chrono::{DateTime, Local};
+use super::TransactionPayload;
 
 #[derive(Clone, Debug)]
 pub struct IncludedTransaction {
@@ -73,6 +72,7 @@ where
     V: Versions,
 {
     type Event = Event<Types>;
+    type Error = Error;
 
     async fn handle_event(&mut self, (event, node_id): (Self::Event, usize)) -> anyhow::Result<()> {
         // We only need to handle events from one node

@@ -6,23 +6,25 @@
 
 use std::{collections::HashMap, num::NonZeroUsize, rc::Rc, sync::Arc, time::Duration};
 
-use anyhow::{ensure, Result};
 use async_lock::RwLock;
 use hotshot::{
     tasks::EventTransformerState,
     traits::{NetworkReliability, NodeImplementation, TestableNodeImplementation},
     types::SystemContextHandle,
-    HotShotInitializer, MarketplaceConfig, SystemContext, TwinsHandlerState,
+    HotShotInitializer, InitializerEpochInfo, MarketplaceConfig, SystemContext, TwinsHandlerState,
 };
 use hotshot_example_types::{
-    auction_results_provider_types::TestAuctionResultsProvider, state_types::TestInstanceState,
-    storage_types::TestStorage, testable_delay::DelayConfig,
+    auction_results_provider_types::TestAuctionResultsProvider, node_types::TestTypes,
+    state_types::TestInstanceState, storage_types::TestStorage, testable_delay::DelayConfig,
 };
 use hotshot_types::{
     consensus::ConsensusMetricsValue,
-    traits::node_implementation::{NodeType, Versions},
+    drb::INITIAL_DRB_RESULT,
+    epoch_membership::EpochMembershipCoordinator,
+    traits::node_implementation::{ConsensusTime, NodeType, Versions},
     HotShotConfig, PeerConfig, ValidatorConfig,
 };
+use hotshot_utils::anytrace::*;
 use tide_disco::Url;
 use vec1::Vec1;
 
@@ -32,6 +34,7 @@ use super::{
     txn_task::TxnTaskDescription,
 };
 use crate::{
+    helpers::{key_pair_for_id, TestNodeKeyMap},
     spinning_task::SpinningTaskDescription,
     test_launcher::{Network, ResourceGenerators, TestLauncher},
     test_task::TestTaskStateSeed,
@@ -60,6 +63,7 @@ pub fn default_hotshot_config<TYPES: NodeType>(
     known_da_nodes: Vec<PeerConfig<TYPES::SignatureKey>>,
     num_bootstrap_nodes: usize,
     epoch_height: u64,
+    epoch_start_block: u64,
 ) -> HotShotConfig<TYPES::SignatureKey> {
     HotShotConfig {
         start_threshold: (1, 1),
@@ -84,6 +88,7 @@ pub fn default_hotshot_config<TYPES: NodeType>(
         start_voting_time: u64::MAX,
         stop_voting_time: 0,
         epoch_height,
+        epoch_start_block,
     }
 }
 
@@ -125,7 +130,7 @@ pub struct TestDescription<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Ver
     /// `HotShotInitializer::from_reload` in the spinning task.
     pub skip_late: bool,
     /// overall safety property description
-    pub overall_safety_properties: OverallSafetyPropertiesDescription<TYPES>,
+    pub overall_safety_properties: OverallSafetyPropertiesDescription,
     /// spinning properties
     pub spinning_properties: SpinningTaskDescription,
     /// txns timing
@@ -237,6 +242,12 @@ pub async fn create_test_handle<
     let initializer = HotShotInitializer::<TYPES>::from_genesis::<V>(
         TestInstanceState::new(metadata.async_delay_config),
         metadata.test_config.epoch_height,
+        metadata.test_config.epoch_start_block,
+        vec![InitializerEpochInfo::<TYPES> {
+            epoch: TYPES::Epoch::new(1),
+            drb_result: INITIAL_DRB_RESULT,
+            block_header: None,
+        }],
     )
     .await
     .unwrap();
@@ -250,6 +261,7 @@ pub async fn create_test_handle<
     // Get key pair for certificate aggregation
     let private_key = validator_config.private_key.clone();
     let public_key = validator_config.public_key.clone();
+    let membership_coordinator = EpochMembershipCoordinator::new(memberships, config.epoch_height);
 
     let behaviour = (metadata.behaviour)(node_id);
     match behaviour {
@@ -261,7 +273,7 @@ pub async fn create_test_handle<
                     private_key,
                     node_id,
                     config,
-                    memberships,
+                    membership_coordinator,
                     network,
                     initializer,
                     ConsensusMetricsValue::default(),
@@ -271,7 +283,7 @@ pub async fn create_test_handle<
                 .await;
 
             left_handle
-        }
+        },
         Behaviour::Byzantine(state) => {
             let state = Box::leak(state);
             state
@@ -280,7 +292,7 @@ pub async fn create_test_handle<
                     private_key,
                     node_id,
                     config,
-                    memberships,
+                    membership_coordinator,
                     network,
                     initializer,
                     ConsensusMetricsValue::default(),
@@ -288,14 +300,14 @@ pub async fn create_test_handle<
                     marketplace_config,
                 )
                 .await
-        }
+        },
         Behaviour::Standard => {
             let hotshot = SystemContext::<TYPES, I, V>::new(
                 public_key,
                 private_key,
                 node_id,
                 config,
-                memberships,
+                membership_coordinator,
                 network,
                 initializer,
                 ConsensusMetricsValue::default(),
@@ -305,7 +317,7 @@ pub async fn create_test_handle<
             .await;
 
             hotshot.run_tasks().await
-        }
+        },
     }
 }
 
@@ -354,14 +366,9 @@ impl<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions> TestDescription
         let num_nodes_with_stake = 100;
 
         Self {
-            overall_safety_properties: OverallSafetyPropertiesDescription::<TYPES> {
+            overall_safety_properties: OverallSafetyPropertiesDescription {
                 num_successful_views: 50,
-                check_leaf: true,
-                check_block: true,
-                num_failed_views: 15,
-                transaction_threshold: 0,
-                threshold_calculator: Arc::new(|_active, total| (2 * total / 3 + 1)),
-                expected_views_to_fail: HashMap::new(),
+                ..OverallSafetyPropertiesDescription::default()
             },
             timing_data: TimingData {
                 next_view_timeout: 2000,
@@ -378,14 +385,9 @@ impl<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions> TestDescription
     pub fn default_multiple_rounds() -> Self {
         let num_nodes_with_stake = 10;
         TestDescription::<TYPES, I, V> {
-            overall_safety_properties: OverallSafetyPropertiesDescription::<TYPES> {
+            overall_safety_properties: OverallSafetyPropertiesDescription {
                 num_successful_views: 20,
-                check_leaf: true,
-                check_block: true,
-                num_failed_views: 8,
-                transaction_threshold: 0,
-                threshold_calculator: Arc::new(|_active, total| (2 * total / 3 + 1)),
-                expected_views_to_fail: HashMap::new(),
+                ..OverallSafetyPropertiesDescription::default()
             },
             timing_data: TimingData {
                 ..TimingData::default()
@@ -402,6 +404,7 @@ impl<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions> TestDescription
         let num_nodes_with_stake = 20;
         let num_da_nodes = 14;
         let epoch_height = 10;
+        let epoch_start_block = 0;
 
         let (staked_nodes, da_nodes) = gen_node_lists::<TYPES>(num_nodes_with_stake, num_da_nodes);
 
@@ -411,6 +414,7 @@ impl<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions> TestDescription
                 da_nodes,
                 num_nodes_with_stake.try_into().unwrap(),
                 epoch_height,
+                epoch_start_block,
             ),
             // The first 14 (i.e., 20 - f) nodes are in the DA committee and we may shutdown the
             // remaining 6 (i.e., f) nodes. We could remove this restriction after fixing the
@@ -447,9 +451,20 @@ impl<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions> TestDescription
                 da_nodes,
                 self.test_config.num_bootstrap,
                 self.test_config.epoch_height,
+                self.test_config.epoch_start_block,
             ),
             ..self
         }
+    }
+
+    pub fn build_node_key_map(&self) -> Arc<TestNodeKeyMap> {
+        let mut node_key_map = TestNodeKeyMap::new();
+        for i in 0..self.test_config.num_nodes_with_stake.into() {
+            let (private_key, public_key) = key_pair_for_id::<TestTypes>(i as u64);
+            node_key_map.insert(public_key, private_key);
+        }
+
+        Arc::new(node_key_map)
     }
 }
 
@@ -462,6 +477,7 @@ impl<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions> Default
         let num_nodes_with_stake = 7;
         let num_da_nodes = num_nodes_with_stake;
         let epoch_height = 10;
+        let epoch_start_block = 0;
 
         let (staked_nodes, da_nodes) = gen_node_lists::<TYPES>(num_nodes_with_stake, num_da_nodes);
 
@@ -471,6 +487,7 @@ impl<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions> Default
                 da_nodes,
                 num_nodes_with_stake.try_into().unwrap(),
                 epoch_height,
+                epoch_start_block,
             ),
             timing_data: TimingData::default(),
             skip_late: false,

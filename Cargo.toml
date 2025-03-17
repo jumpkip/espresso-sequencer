@@ -43,7 +43,8 @@ members = [
     "sequencer",
     "tests",
     "types",
-    "utils"
+    "utils",
+    "vid"
 ]
 
 exclude = ["sequencer-sqlite"]
@@ -117,6 +118,7 @@ libp2p-swarm-derive = { version = "0.35" }
 typenum = "1"
 cbor4ii = { version = "1.0", features = ["serde1"] }
 serde_bytes = { version = "0.11" }
+semver = "1"
 num_cpus = "1"
 dashmap = "6"
 memoize = { version = "0.4", features = ["full"] }
@@ -149,6 +151,9 @@ hotshot-libp2p-networking = { path = "hotshot-libp2p-networking" }
 hotshot-contract-adapter = { path = "contracts/rust/adapter" }
 # Temporary, used to pull in the mock auction results provider
 hotshot-example-types = { path = "hotshot-example-types" }
+
+# VID import
+vid = { path = "vid", features = [ "parallel", "keccak256" ] }
 
 jf-plonk = { git = "https://github.com/EspressoSystems/jellyfish", tag = "jf-plonk-v0.5.1", features = [
     "test-apis",
@@ -193,7 +198,7 @@ log-panics = { version = "2.0", features = ["with-backtrace"] }
 lru = "0.12"
 strum = { version = "0.26", features = ["derive"] }
 surf-disco = "0.9"
-sqlx = "=0.8.2"
+sqlx = "=0.8.3"
 tagged-base64 = "0.4"
 tide-disco = "0.9.3"
 thiserror = "1.0.69"
@@ -225,12 +230,18 @@ time = "0.3"
 trait-set = "0.3.0"
 
 [profile.dev]
-# No optimizations
-opt-level = 0
-# Skip compiling the debug information.
-debug = false
-# Skip linking symbols.
-strip = true
+# Probably the least demanding setting in terms of compilation time and memory
+# that still provide tracebacks with line numbers.
+strip = "none"
+debug = "line-tables-only"
+
+[profile.dev-debug]
+# This profile should allow connecting debuggers. Compiles more slowly and
+# requires significantly more memory to compile.
+inherits = "dev"
+strip = "none"
+debug = "full"
+
 [profile.test]
 opt-level = 1
 [profile.test.package.tests]

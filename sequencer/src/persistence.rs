@@ -43,8 +43,7 @@ mod testing {
 #[cfg(test)]
 #[espresso_macros::generic_tests]
 mod persistence_tests {
-    use std::{collections::BTreeMap, marker::PhantomData};
-    use vbs::version::StaticVersionType;
+    use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 
     use anyhow::bail;
     use async_lock::RwLock;
@@ -53,30 +52,35 @@ mod persistence_tests {
         traits::{EventConsumer, NullEventConsumer, PersistenceOptions},
         Event, Leaf, Leaf2, NodeState, PubKey, SeqTypes, ValidatedState,
     };
-    use hotshot::types::{BLSPubKey, SignatureKey};
+    use hotshot::{
+        types::{BLSPubKey, SignatureKey},
+        InitializerEpochInfo,
+    };
     use hotshot_example_types::node_types::TestVersions;
     use hotshot_query_service::testing::mocks::MockVersions;
     use hotshot_types::{
         data::{
-            vid_disperse::ADVZDisperseShare, DaProposal, EpochNumber, QuorumProposal2,
-            QuorumProposalWrapper, VidDisperseShare, ViewNumber,
+            ns_table::parse_ns_table, vid_commitment, vid_disperse::VidDisperseShare2, DaProposal2,
+            EpochNumber, QuorumProposal2, QuorumProposalWrapper, VidCommitment, VidDisperseShare,
+            ViewNumber,
         },
         event::{EventType, HotShotAction, LeafInfo},
-        message::{Proposal, UpgradeLock},
-        simple_certificate::{NextEpochQuorumCertificate2, QuorumCertificate, UpgradeCertificate},
+        message::{convert_proposal, Proposal, UpgradeLock},
+        simple_certificate::{
+            NextEpochQuorumCertificate2, QuorumCertificate, QuorumCertificate2, UpgradeCertificate,
+        },
         simple_vote::{NextEpochQuorumData2, QuorumData2, UpgradeProposalData, VersionedVoteData},
         traits::{
-            block_contents::vid_commitment,
+            block_contents::BlockHeader,
             node_implementation::{ConsensusTime, Versions},
             EncodeBytes,
         },
-        vid::advz_scheme,
+        vid::avidm::{init_avidm_param, AvidMScheme},
+        vote::HasViewNumber,
     };
-    use jf_vid::VidScheme;
     use sequencer_utils::test_utils::setup_test;
-    use std::sync::Arc;
     use testing::TestablePersistence;
-    use vbs::version::Version;
+    use vbs::version::{StaticVersionType, Version};
 
     use super::*;
 
@@ -152,6 +156,52 @@ mod persistence_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    pub async fn test_epoch_info<P: TestablePersistence>() {
+        setup_test();
+
+        let tmp = P::tmp_storage().await;
+        let storage = P::connect(&tmp).await;
+
+        // Initially, there is no saved info.
+        assert_eq!(storage.load_start_epoch_info().await.unwrap(), Vec::new());
+
+        // Store a drb result.
+        storage
+            .add_drb_result(EpochNumber::new(1), [1; 32])
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.load_start_epoch_info().await.unwrap(),
+            vec![InitializerEpochInfo::<SeqTypes> {
+                epoch: EpochNumber::new(1),
+                drb_result: [1; 32],
+                block_header: None,
+            }]
+        );
+
+        // Store a second DRB result
+        storage
+            .add_drb_result(EpochNumber::new(2), [3; 32])
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.load_start_epoch_info().await.unwrap(),
+            vec![
+                InitializerEpochInfo::<SeqTypes> {
+                    epoch: EpochNumber::new(1),
+                    drb_result: [1; 32],
+                    block_header: None,
+                },
+                InitializerEpochInfo::<SeqTypes> {
+                    epoch: EpochNumber::new(2),
+                    drb_result: [3; 32],
+                    block_header: None,
+                }
+            ]
+        );
+    }
+
     fn leaf_info(leaf: Leaf2) -> LeafInfo<SeqTypes> {
         LeafInfo {
             leaf,
@@ -175,22 +225,31 @@ mod persistence_tests {
         );
 
         let leaf: Leaf2 =
-            Leaf::genesis::<MockVersions>(&ValidatedState::default(), &NodeState::mock())
-                .await
-                .into();
+            Leaf2::genesis::<TestVersions>(&ValidatedState::default(), &NodeState::mock()).await;
         let leaf_payload = leaf.block_payload().unwrap();
         let leaf_payload_bytes_arc = leaf_payload.encode();
-        let disperse = advz_scheme(2)
-            .disperse(leaf_payload_bytes_arc.clone())
-            .unwrap();
+
+        let avidm_param = init_avidm_param(2).unwrap();
+        let weights = vec![1u32; 2];
+
+        let ns_table = parse_ns_table(
+            leaf_payload.byte_len().as_usize(),
+            &leaf_payload.ns_table().encode(),
+        );
+        let (payload_commitment, shares) =
+            AvidMScheme::ns_disperse(&avidm_param, &weights, &leaf_payload_bytes_arc, ns_table)
+                .unwrap();
+
         let (pubkey, privkey) = BLSPubKey::generated_from_seed_indexed([0; 32], 1);
         let signature = PubKey::sign(&privkey, &[]).unwrap();
-        let mut vid = ADVZDisperseShare::<SeqTypes> {
+        let mut vid = VidDisperseShare2::<SeqTypes> {
             view_number: ViewNumber::new(0),
-            payload_commitment: Default::default(),
-            share: disperse.shares[0].clone(),
-            common: disperse.common,
+            payload_commitment,
+            share: shares[0].clone(),
             recipient_key: pubkey,
+            epoch: Some(EpochNumber::new(0)),
+            target_epoch: Some(EpochNumber::new(0)),
+            common: avidm_param,
         };
         let mut quorum_proposal = Proposal {
             data: QuorumProposalWrapper::<SeqTypes> {
@@ -198,12 +257,11 @@ mod persistence_tests {
                     epoch: None,
                     block_header: leaf.block_header().clone(),
                     view_number: ViewNumber::genesis(),
-                    justify_qc: QuorumCertificate::genesis::<TestVersions>(
+                    justify_qc: QuorumCertificate2::genesis::<TestVersions>(
                         &ValidatedState::default(),
                         &NodeState::mock(),
                     )
-                    .await
-                    .to_qc2(),
+                    .await,
                     upgrade_certificate: None,
                     view_change_evidence: None,
                     next_drb_result: None,
@@ -216,50 +274,51 @@ mod persistence_tests {
 
         let vid_share0 = vid.clone().to_proposal(&privkey).unwrap().clone();
 
-        storage.append_vid(&vid_share0).await.unwrap();
+        storage.append_vid2(&vid_share0).await.unwrap();
 
         assert_eq!(
             storage.load_vid_share(ViewNumber::new(0)).await.unwrap(),
-            Some(vid_share0.clone())
+            Some(convert_proposal(vid_share0.clone()))
         );
 
         vid.view_number = ViewNumber::new(1);
 
         let vid_share1 = vid.clone().to_proposal(&privkey).unwrap().clone();
-        storage.append_vid(&vid_share1).await.unwrap();
+        storage.append_vid2(&vid_share1).await.unwrap();
 
         assert_eq!(
-            storage.load_vid_share(vid.view_number).await.unwrap(),
-            Some(vid_share1.clone())
+            storage.load_vid_share(vid.view_number()).await.unwrap(),
+            Some(convert_proposal(vid_share1.clone()))
         );
 
         vid.view_number = ViewNumber::new(2);
 
         let vid_share2 = vid.clone().to_proposal(&privkey).unwrap().clone();
-        storage.append_vid(&vid_share2).await.unwrap();
+        storage.append_vid2(&vid_share2).await.unwrap();
 
         assert_eq!(
-            storage.load_vid_share(vid.view_number).await.unwrap(),
-            Some(vid_share2.clone())
+            storage.load_vid_share(vid.view_number()).await.unwrap(),
+            Some(convert_proposal(vid_share2.clone()))
         );
 
         vid.view_number = ViewNumber::new(3);
 
         let vid_share3 = vid.clone().to_proposal(&privkey).unwrap().clone();
-        storage.append_vid(&vid_share3).await.unwrap();
+        storage.append_vid2(&vid_share3).await.unwrap();
 
         assert_eq!(
-            storage.load_vid_share(vid.view_number).await.unwrap(),
-            Some(vid_share3.clone())
+            storage.load_vid_share(vid.view_number()).await.unwrap(),
+            Some(convert_proposal(vid_share3.clone()))
         );
 
         let block_payload_signature = BLSPubKey::sign(&privkey, &leaf_payload_bytes_arc)
             .expect("Failed to sign block payload");
 
-        let da_proposal_inner = DaProposal::<SeqTypes> {
+        let da_proposal_inner = DaProposal2::<SeqTypes> {
             encoded_transactions: leaf_payload_bytes_arc.clone(),
             metadata: leaf_payload.ns_table().clone(),
             view_number: ViewNumber::new(0),
+            epoch: None,
         };
 
         let da_proposal = Proposal {
@@ -270,12 +329,13 @@ mod persistence_tests {
 
         let vid_commitment = vid_commitment::<TestVersions>(
             &leaf_payload_bytes_arc,
+            &leaf.block_header().metadata().encode(),
             2,
             <TestVersions as Versions>::Base::VERSION,
         );
 
         storage
-            .append_da(&da_proposal, vid_commitment)
+            .append_da2(&da_proposal, vid_commitment)
             .await
             .unwrap();
 
@@ -287,7 +347,7 @@ mod persistence_tests {
         let mut da_proposal1 = da_proposal.clone();
         da_proposal1.data.view_number = ViewNumber::new(1);
         storage
-            .append_da(&da_proposal1.clone(), vid_commitment)
+            .append_da2(&da_proposal1.clone(), vid_commitment)
             .await
             .unwrap();
 
@@ -302,7 +362,7 @@ mod persistence_tests {
         let mut da_proposal2 = da_proposal1.clone();
         da_proposal2.data.view_number = ViewNumber::new(2);
         storage
-            .append_da(&da_proposal2.clone(), vid_commitment)
+            .append_da2(&da_proposal2.clone(), vid_commitment)
             .await
             .unwrap();
 
@@ -317,7 +377,7 @@ mod persistence_tests {
         let mut da_proposal3 = da_proposal2.clone();
         da_proposal3.data.view_number = ViewNumber::new(3);
         storage
-            .append_da(&da_proposal3.clone(), vid_commitment)
+            .append_da2(&da_proposal3.clone(), vid_commitment)
             .await
             .unwrap();
 
@@ -330,8 +390,9 @@ mod persistence_tests {
         );
 
         let quorum_proposal1 = quorum_proposal.clone();
+
         storage
-            .append_quorum_proposal(&quorum_proposal1)
+            .append_quorum_proposal2(&quorum_proposal1)
             .await
             .unwrap();
 
@@ -343,7 +404,7 @@ mod persistence_tests {
         quorum_proposal.data.proposal.view_number = ViewNumber::new(1);
         let quorum_proposal2 = quorum_proposal.clone();
         storage
-            .append_quorum_proposal(&quorum_proposal2)
+            .append_quorum_proposal2(&quorum_proposal2)
             .await
             .unwrap();
 
@@ -359,7 +420,7 @@ mod persistence_tests {
         quorum_proposal.data.proposal.justify_qc.view_number = ViewNumber::new(1);
         let quorum_proposal3 = quorum_proposal.clone();
         storage
-            .append_quorum_proposal(&quorum_proposal3)
+            .append_quorum_proposal2(&quorum_proposal3)
             .await
             .unwrap();
 
@@ -378,7 +439,7 @@ mod persistence_tests {
         // This one should stick around after GC runs.
         let quorum_proposal4 = quorum_proposal.clone();
         storage
-            .append_quorum_proposal(&quorum_proposal4)
+            .append_quorum_proposal2(&quorum_proposal4)
             .await
             .unwrap();
 
@@ -455,7 +516,7 @@ mod persistence_tests {
 
         assert_eq!(
             storage.load_vid_share(ViewNumber::new(3)).await.unwrap(),
-            Some(vid_share3.clone())
+            Some(convert_proposal(vid_share3.clone()))
         );
 
         let proposals = storage.load_quorum_proposals().await.unwrap();
@@ -668,16 +729,25 @@ mod persistence_tests {
                 .into();
         let leaf_payload = leaf.block_payload().unwrap();
         let leaf_payload_bytes_arc = leaf_payload.encode();
-        let disperse = advz_scheme(2)
-            .disperse(leaf_payload_bytes_arc.clone())
-            .unwrap();
+        let avidm_param = init_avidm_param(2).unwrap();
+        let weights = vec![1u32; 2];
+        let ns_table = parse_ns_table(
+            leaf_payload.byte_len().as_usize(),
+            &leaf_payload.ns_table().encode(),
+        );
+        let (payload_commitment, shares) =
+            AvidMScheme::ns_disperse(&avidm_param, &weights, &leaf_payload_bytes_arc, ns_table)
+                .unwrap();
+
         let (pubkey, privkey) = BLSPubKey::generated_from_seed_indexed([0; 32], 1);
-        let mut vid = ADVZDisperseShare::<SeqTypes> {
+        let mut vid = VidDisperseShare2::<SeqTypes> {
             view_number: ViewNumber::new(0),
-            payload_commitment: Default::default(),
-            share: disperse.shares[0].clone(),
-            common: disperse.common,
+            payload_commitment,
+            share: shares[0].clone(),
             recipient_key: pubkey,
+            epoch: Some(EpochNumber::new(0)),
+            target_epoch: Some(EpochNumber::new(0)),
+            common: avidm_param,
         }
         .to_proposal(&privkey)
         .unwrap()
@@ -699,20 +769,20 @@ mod persistence_tests {
                 epoch: None,
             },
         };
-        let mut qc = QuorumCertificate::genesis::<TestVersions>(
+        let mut qc = QuorumCertificate2::genesis::<TestVersions>(
             &ValidatedState::default(),
             &NodeState::mock(),
         )
-        .await
-        .to_qc2();
+        .await;
 
         let block_payload_signature = BLSPubKey::sign(&privkey, &leaf_payload_bytes_arc)
             .expect("Failed to sign block payload");
         let mut da_proposal = Proposal {
-            data: DaProposal::<SeqTypes> {
+            data: DaProposal2::<SeqTypes> {
                 encoded_transactions: leaf_payload_bytes_arc.clone(),
                 metadata: leaf_payload.ns_table().clone(),
                 view_number: ViewNumber::new(0),
+                epoch: Some(EpochNumber::new(0)),
             },
             signature: block_payload_signature,
             _pd: Default::default(),
@@ -720,6 +790,7 @@ mod persistence_tests {
 
         let vid_commitment = vid_commitment::<TestVersions>(
             &leaf_payload_bytes_arc,
+            &leaf.block_header().metadata().encode(),
             2,
             <TestVersions as Versions>::Base::VERSION,
         );
@@ -737,15 +808,15 @@ mod persistence_tests {
         // Add proposals.
         for (_, _, vid, da) in &chain {
             tracing::info!(?da, ?vid, "insert proposal");
-            storage.append_da(da, vid_commitment).await.unwrap();
-            storage.append_vid(vid).await.unwrap();
+            storage.append_da2(da, vid_commitment).await.unwrap();
+            storage.append_vid2(vid).await.unwrap();
         }
 
         // Decide 2 leaves, but fail in event processing.
         let leaf_chain = chain
             .iter()
             .take(2)
-            .map(|(leaf, qc, _, _)| (leaf_info(leaf.clone()), qc.clone()))
+            .map(|(leaf, qc, ..)| (leaf_info(leaf.clone()), qc.clone()))
             .collect::<Vec<_>>();
         tracing::info!("decide with event handling failure");
         storage
@@ -792,7 +863,7 @@ mod persistence_tests {
         let leaf_chain = chain
             .iter()
             .skip(2)
-            .map(|(leaf, qc, _, _)| (leaf_info(leaf.clone()), qc.clone()))
+            .map(|(leaf, qc, ..)| (leaf_info(leaf.clone()), qc.clone()))
             .collect::<Vec<_>>();
         tracing::info!("decide successfully");
         storage
@@ -837,7 +908,7 @@ mod persistence_tests {
         tracing::info!("check decide event");
         let leaf_chain = consumer.leaf_chain().await;
         assert_eq!(leaf_chain.len(), 4, "{leaf_chain:#?}");
-        for ((leaf, _, _, _), info) in chain.iter().zip(leaf_chain.iter()) {
+        for ((leaf, ..), info) in chain.iter().zip(leaf_chain.iter()) {
             assert_eq!(info.leaf, *leaf);
             let decided_vid_share = info.vid_share.as_ref().unwrap();
             let view_number = match decided_vid_share {
@@ -864,17 +935,26 @@ mod persistence_tests {
             Leaf::genesis::<MockVersions>(&ValidatedState::default(), &NodeState::mock()).await;
         let leaf_payload = leaf.block_payload().unwrap();
         let leaf_payload_bytes_arc = leaf_payload.encode();
-        let disperse = advz_scheme(2)
-            .disperse(leaf_payload_bytes_arc.clone())
-            .unwrap();
-        let payload_commitment = disperse.commit;
+        let avidm_param = init_avidm_param(2).unwrap();
+        let weights = vec![1u32; 2];
+
+        let ns_table = parse_ns_table(
+            leaf_payload.byte_len().as_usize(),
+            &leaf_payload.ns_table().encode(),
+        );
+        let (payload_commitment, shares) =
+            AvidMScheme::ns_disperse(&avidm_param, &weights, &leaf_payload_bytes_arc, ns_table)
+                .unwrap();
+
         let (pubkey, privkey) = BLSPubKey::generated_from_seed_indexed([0; 32], 1);
-        let vid_share = ADVZDisperseShare::<SeqTypes> {
+        let vid_share = VidDisperseShare2::<SeqTypes> {
             view_number: ViewNumber::new(0),
             payload_commitment,
-            share: disperse.shares[0].clone(),
-            common: disperse.common,
+            share: shares[0].clone(),
             recipient_key: pubkey,
+            epoch: None,
+            target_epoch: None,
+            common: avidm_param,
         }
         .to_proposal(&privkey)
         .unwrap()
@@ -909,22 +989,23 @@ mod persistence_tests {
         let block_payload_signature = BLSPubKey::sign(&privkey, &leaf_payload_bytes_arc)
             .expect("Failed to sign block payload");
         let da_proposal = Proposal {
-            data: DaProposal::<SeqTypes> {
+            data: DaProposal2::<SeqTypes> {
                 encoded_transactions: leaf_payload_bytes_arc,
                 metadata: leaf_payload.ns_table().clone(),
                 view_number: ViewNumber::new(0),
+                epoch: None,
             },
             signature: block_payload_signature,
             _pd: Default::default(),
         };
 
         storage
-            .append_da(&da_proposal, payload_commitment)
+            .append_da2(&da_proposal, VidCommitment::V1(payload_commitment))
             .await
             .unwrap();
-        storage.append_vid(&vid_share).await.unwrap();
+        storage.append_vid2(&vid_share).await.unwrap();
         storage
-            .append_quorum_proposal(&quorum_proposal)
+            .append_quorum_proposal2(&quorum_proposal)
             .await
             .unwrap();
 
@@ -950,7 +1031,7 @@ mod persistence_tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            vid_share
+            convert_proposal(vid_share)
         );
         assert_eq!(
             storage

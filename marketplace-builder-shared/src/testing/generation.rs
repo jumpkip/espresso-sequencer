@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::{Error, Result};
 use async_lock::RwLock;
 use async_trait::async_trait;
 use chrono::Local;
@@ -136,7 +137,7 @@ where
                             .map(Result::unwrap),
                     );
                 }
-            }
+            },
             GenerationStrategy::Random {
                 min_per_view,
                 max_per_view,
@@ -163,7 +164,7 @@ where
 
                     self.txn_nonce += 1;
                 }
-            }
+            },
             GenerationStrategy::Flood {
                 min_tx_size,
                 max_tx_size,
@@ -187,7 +188,7 @@ where
 
                     self.txn_nonce += 1;
                 }
-            }
+            },
         };
     }
 }
@@ -200,8 +201,9 @@ where
     V: Versions,
 {
     type Event = Event<Types>;
+    type Error = Error;
 
-    async fn handle_event(&mut self, (event, node_id): (Self::Event, usize)) -> anyhow::Result<()> {
+    async fn handle_event(&mut self, (event, node_id): (Self::Event, usize)) -> Result<()> {
         // We only need to handle events from one node
         if node_id != 0 {
             return Ok(());
@@ -233,7 +235,7 @@ where
                             .publish_transaction_async(txn)
                             .await
                             .expect("Failed to submit transaction to public mempool");
-                    }
+                    },
                     SubmissionEndpoint::Private => {
                         if let Err(e) = private_mempool_client
                             .post::<()>("submit")
@@ -246,17 +248,17 @@ where
                                 // If we can't reach the builder altogether, test should fail
                                 builder::Error::Request(request_error) => {
                                     panic!("Builder API not available: {request_error}")
-                                }
+                                },
                                 // If the builder returns an error, we will re-submit this transaction
                                 // on the next view, so we return it to the queue and break
                                 error => {
                                     tracing::warn!(?error, "Builder API error");
                                     self.txn_queue.push_front(txn);
                                     break;
-                                }
+                                },
                             };
                         }
-                    }
+                    },
                 }
             }
         }
