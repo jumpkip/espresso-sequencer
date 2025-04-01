@@ -148,7 +148,7 @@ impl<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions> DaTaskState<TYP
                 let epoch_number = proposal.data.epoch;
                 let membership = self
                     .membership_coordinator
-                    .membership_for_epoch(epoch_number)
+                    .stake_table_for_epoch(epoch_number)
                     .await
                     .context(warn!("No stake table for epoch"))?;
 
@@ -187,7 +187,11 @@ impl<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions> DaTaskState<TYP
                 let mut next_epoch_total_weight = total_weight;
                 if epoch_number.is_some() {
                     next_epoch_total_weight = vid_total_weight::<TYPES>(
-                        membership.next_epoch().await?.stake_table().await,
+                        membership
+                            .next_epoch_stake_table()
+                            .await?
+                            .stake_table()
+                            .await,
                         epoch_number.map(|epoch| epoch + 1),
                     );
                 }
@@ -203,7 +207,10 @@ impl<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions> DaTaskState<TYP
                 })
                 .await;
                 let payload_commitment = payload_commitment.unwrap();
-                let next_epoch_payload_commitment = if self
+                let next_epoch_payload_commitment = if matches!(
+                    proposal.data.epoch_transition_indicator,
+                    EpochTransitionIndicator::InTransition
+                ) && self
                     .upgrade_lock
                     .epochs_enabled(proposal.data.view_number())
                     .await
@@ -284,7 +291,12 @@ impl<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions> DaTaskState<TYP
 
                     let target_epoch = if membership.has_stake(&public_key).await {
                         epoch_number
-                    } else if membership.next_epoch().await?.has_stake(&public_key).await {
+                    } else if membership
+                        .next_epoch_stake_table()
+                        .await?
+                        .has_stake(&public_key)
+                        .await
+                    {
                         next_epoch
                     } else {
                         bail!("Not calculating VID, the node doesn't belong to the current epoch or the next epoch.");
@@ -400,12 +412,19 @@ impl<TYPES: NodeType, I: NodeImplementation<TYPES>, V: Versions> DaTaskState<TYP
                     );
                     return Ok(());
                 }
+                let epoch_transition_indicator =
+                    if self.consensus.read().await.is_high_qc_ge_root_block() {
+                        EpochTransitionIndicator::InTransition
+                    } else {
+                        EpochTransitionIndicator::NotInTransition
+                    };
                 let data: DaProposal2<TYPES> = DaProposal2 {
                     encoded_transactions: Arc::clone(encoded_transactions),
                     metadata: metadata.clone(),
                     // Upon entering a new view we want to send a DA Proposal for the next view -> Is it always the case that this is cur_view + 1?
                     view_number,
                     epoch,
+                    epoch_transition_indicator,
                 };
 
                 let message = Proposal {

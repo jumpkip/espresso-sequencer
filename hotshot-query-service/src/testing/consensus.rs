@@ -43,6 +43,7 @@ use hotshot_types::{
     },
     HotShotConfig, PeerConfig,
 };
+use primitive_types::U256;
 use tokio::{
     runtime::Handle,
     task::{block_in_place, yield_now},
@@ -90,7 +91,7 @@ impl<D: DataSourceLifeCycle + UpdateStatusData, V: Versions> MockNetwork<D, V> {
     }
 
     pub async fn init_with_config(
-        update_config: impl FnOnce(&mut HotShotConfig<BLSPubKey>),
+        update_config: impl FnOnce(&mut HotShotConfig<MockTypes>),
         leaf_only: bool,
     ) -> Self {
         let (pub_keys, priv_keys): (Vec<_>, Vec<_>) = (0..NUM_NODES)
@@ -104,7 +105,7 @@ impl<D: DataSourceLifeCycle + UpdateStatusData, V: Versions> MockNetwork<D, V> {
         let stake = 1u64;
         let known_nodes_with_stake = (0..num_staked_nodes.into())
             .map(|id| PeerConfig {
-                stake_table_entry: pub_keys[id].stake_table_entry(stake),
+                stake_table_entry: pub_keys[id].stake_table_entry(U256::from(stake)),
                 state_ver_key: state_key_pairs[id].ver_key(),
             })
             .collect::<Vec<_>>();
@@ -170,6 +171,10 @@ impl<D: DataSourceLifeCycle + UpdateStatusData, V: Versions> MockNetwork<D, V> {
 
                     let pub_keys = pub_keys.clone();
                     let master_map = master_map.clone();
+                    let state_priv_keys = state_key_pairs
+                        .iter()
+                        .map(|kp| kp.sign_key())
+                        .collect::<Vec<_>>();
 
                     let span = info_span!("initialize node", node_id);
                     async move {
@@ -198,6 +203,7 @@ impl<D: DataSourceLifeCycle + UpdateStatusData, V: Versions> MockNetwork<D, V> {
                         let hotshot = SystemContext::init(
                             pub_keys[node_id],
                             priv_key,
+                            state_priv_keys[node_id].clone(),
                             node_id as u64,
                             config,
                             memberships,

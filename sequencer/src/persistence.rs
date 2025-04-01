@@ -75,6 +75,7 @@ mod persistence_tests {
             node_implementation::{ConsensusTime, Versions},
             EncodeBytes,
         },
+        utils::EpochTransitionIndicator,
         vid::avidm::{init_avidm_param, AvidMScheme},
         vote::HasViewNumber,
     };
@@ -192,6 +193,35 @@ mod persistence_tests {
                     epoch: EpochNumber::new(1),
                     drb_result: [1; 32],
                     block_header: None,
+                },
+                InitializerEpochInfo::<SeqTypes> {
+                    epoch: EpochNumber::new(2),
+                    drb_result: [3; 32],
+                    block_header: None,
+                }
+            ]
+        );
+
+        // Make a header
+        let instance_state = NodeState::mock();
+        let validated_state = hotshot_types::traits::ValidatedState::genesis(&instance_state).0;
+        let leaf: Leaf2 = Leaf::genesis::<MockVersions>(&validated_state, &instance_state)
+            .await
+            .into();
+        let header = leaf.block_header().clone();
+
+        // Test storing the header
+        storage
+            .add_epoch_root(EpochNumber::new(1), header.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.load_start_epoch_info().await.unwrap(),
+            vec![
+                InitializerEpochInfo::<SeqTypes> {
+                    epoch: EpochNumber::new(1),
+                    drb_result: [1; 32],
+                    block_header: Some(header.clone()),
                 },
                 InitializerEpochInfo::<SeqTypes> {
                     epoch: EpochNumber::new(2),
@@ -319,6 +349,7 @@ mod persistence_tests {
             metadata: leaf_payload.ns_table().clone(),
             view_number: ViewNumber::new(0),
             epoch: None,
+            epoch_transition_indicator: EpochTransitionIndicator::NotInTransition,
         };
 
         let da_proposal = Proposal {
@@ -656,14 +687,12 @@ mod persistence_tests {
 
         let genesis_view = ViewNumber::genesis();
 
+        let leaf =
+            Leaf2::genesis::<TestVersions>(&ValidatedState::default(), &NodeState::default()).await;
         let data: NextEpochQuorumData2<SeqTypes> = QuorumData2 {
-            leaf_commit: Leaf2::genesis::<TestVersions>(
-                &ValidatedState::default(),
-                &NodeState::default(),
-            )
-            .await
-            .commit(),
+            leaf_commit: leaf.commit(),
             epoch: Some(EpochNumber::new(1)),
+            block_number: Some(leaf.height()),
         }
         .into();
 
@@ -783,6 +812,7 @@ mod persistence_tests {
                 metadata: leaf_payload.ns_table().clone(),
                 view_number: ViewNumber::new(0),
                 epoch: Some(EpochNumber::new(0)),
+                epoch_transition_indicator: EpochTransitionIndicator::NotInTransition,
             },
             signature: block_payload_signature,
             _pd: Default::default(),
@@ -994,6 +1024,7 @@ mod persistence_tests {
                 metadata: leaf_payload.ns_table().clone(),
                 view_number: ViewNumber::new(0),
                 epoch: None,
+                epoch_transition_indicator: EpochTransitionIndicator::NotInTransition,
             },
             signature: block_payload_signature,
             _pd: Default::default(),

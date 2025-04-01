@@ -27,13 +27,6 @@ pub async fn main() -> anyhow::Result<()> {
     tracing::warn!(?modules, "sequencer starting up");
 
     let genesis = Genesis::from_file(&opt.genesis_file)?;
-
-    // validate that the fee contract is a proxy and panic otherwise
-    genesis
-        .validate_fee_contract(opt.l1_provider_url[0].clone())
-        .await
-        .unwrap();
-
     tracing::info!(?genesis, "genesis");
 
     let base = genesis.base_version;
@@ -301,6 +294,7 @@ mod test {
             upgrades: Default::default(),
             base_version: Version { major: 0, minor: 1 },
             upgrade_version: Version { major: 0, minor: 2 },
+            epoch_height: None,
         };
         genesis.to_file(&genesis_file).unwrap();
 
