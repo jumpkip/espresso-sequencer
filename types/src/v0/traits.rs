@@ -2,80 +2,84 @@
 //! It also includes some trait implementations that cannot be implemented in an external crate.
 use std::{cmp::max, collections::BTreeMap, fmt::Debug, ops::Range, sync::Arc};
 
+use alloy::primitives::U256;
 use anyhow::{bail, ensure, Context};
 use async_trait::async_trait;
 use committable::Commitment;
 use futures::{FutureExt, TryFutureExt};
-use hotshot::{
-    types::{BLSPubKey, EventType},
-    HotShotInitializer, InitializerEpochInfo,
-};
+use hotshot::{types::EventType, HotShotInitializer, InitializerEpochInfo};
+use hotshot_libp2p_networking::network::behaviours::dht::store::persistent::DhtPersistentStorage;
 use hotshot_types::{
     data::{
         vid_disperse::{ADVZDisperseShare, VidDisperseShare2},
         DaProposal, DaProposal2, EpochNumber, QuorumProposal, QuorumProposal2,
         QuorumProposalWrapper, VidCommitment, VidDisperseShare, ViewNumber,
     },
-    drb::DrbResult,
+    drb::{DrbInput, DrbResult},
     event::{HotShotAction, LeafInfo},
-    message::{convert_proposal, Proposal, UpgradeLock},
+    message::{convert_proposal, Proposal},
     simple_certificate::{
-        LightClientStateUpdateCertificate, NextEpochQuorumCertificate2, QuorumCertificate,
+        LightClientStateUpdateCertificateV2, NextEpochQuorumCertificate2, QuorumCertificate,
         QuorumCertificate2, UpgradeCertificate,
     },
+    stake_table::HSStakeTable,
     traits::{
+        metrics::Metrics,
         node_implementation::{ConsensusTime, NodeType, Versions},
         storage::Storage,
         ValidatedState as HotShotState,
     },
-    utils::{genesis_epoch_from_version, verify_leaf_chain},
-    PeerConfig,
+    utils::genesis_epoch_from_version,
 };
-use indexmap::IndexMap;
-use itertools::Itertools;
-use primitive_types::U256;
 use serde::{de::DeserializeOwned, Serialize};
 
 use super::{
     impls::NodeState,
     utils::BackoffParams,
-    v0_1::{RewardAccount, RewardAccountProof, RewardMerkleCommitment, RewardMerkleTree},
-    v0_3::{IndexedStake, Validator},
-    EpochVersion, SequencerVersions,
+    v0_3::{EventKey, IndexedStake, StakeTableEvent},
 };
 use crate::{
-    v0::impls::ValidatedState, v0_99::ChainConfig, BlockMerkleTree, Event, FeeAccount,
-    FeeAccountProof, FeeMerkleCommitment, FeeMerkleTree, Leaf2, NetworkConfig, SeqTypes,
+    v0::impls::ValidatedState,
+    v0_3::{
+        ChainConfig, RewardAccountProofV1, RewardAccountV1, RewardAmount, RewardMerkleCommitmentV1,
+    },
+    v0_4::{RewardAccountProofV2, RewardAccountV2, RewardMerkleCommitmentV2},
+    BlockMerkleTree, Event, FeeAccount, FeeAccountProof, FeeMerkleCommitment, Leaf2, NetworkConfig,
+    SeqTypes, ValidatorMap,
 };
 
 #[async_trait]
 pub trait StateCatchup: Send + Sync {
-    async fn try_fetch_leaves(&self, retry: usize, height: u64) -> anyhow::Result<Vec<Leaf2>>;
+    /// Fetch the leaf at the given height without retrying on transient errors.
+    async fn try_fetch_leaf(
+        &self,
+        retry: usize,
+        height: u64,
+        stake_table: HSStakeTable<SeqTypes>,
+        success_threshold: U256,
+    ) -> anyhow::Result<Leaf2>;
 
+    /// Fetch the leaf at the given height, retrying on transient errors.
     async fn fetch_leaf(
         &self,
         height: u64,
-        stake_table: Vec<PeerConfig<SeqTypes>>,
+        stake_table: HSStakeTable<SeqTypes>,
         success_threshold: U256,
     ) -> anyhow::Result<Leaf2> {
-        self.backoff().retry(
-            self, |provider, retry| {
-        let stake_table_clone = stake_table.clone();
-        async move {
-                    let mut chain = provider.try_fetch_leaves(retry, height).await?;
-                    chain.sort_by_key(|l| l.view_number());
-                    let leaf_chain = chain.into_iter().rev().collect();
-                    verify_leaf_chain(
-                        leaf_chain,
-                        stake_table_clone.clone(),
-                        success_threshold,
-                        height,
-                        &UpgradeLock::<SeqTypes, SequencerVersions<EpochVersion, EpochVersion>>::new()).await
-                }.boxed()
-            }).await
+        self.backoff()
+            .retry(self, |provider, retry| {
+                let stake_table_clone = stake_table.clone();
+                async move {
+                    provider
+                        .try_fetch_leaf(retry, height, stake_table_clone, success_threshold)
+                        .await
+                }
+                .boxed()
+            })
+            .await
     }
 
-    /// Try to fetch the given accounts state, failing without retrying if unable.
+    /// Fetch the given list of accounts without retrying on transient errors.
     async fn try_fetch_accounts(
         &self,
         retry: usize,
@@ -83,8 +87,8 @@ pub trait StateCatchup: Send + Sync {
         height: u64,
         view: ViewNumber,
         fee_merkle_tree_root: FeeMerkleCommitment,
-        account: &[FeeAccount],
-    ) -> anyhow::Result<FeeMerkleTree>;
+        accounts: &[FeeAccount],
+    ) -> anyhow::Result<Vec<FeeAccountProof>>;
 
     /// Fetch the given list of accounts, retrying on transient errors.
     async fn fetch_accounts(
@@ -99,7 +103,7 @@ pub trait StateCatchup: Send + Sync {
             .retry(self, |provider, retry| {
                 let accounts = &accounts;
                 async move {
-                    let tree = provider
+                    provider
                         .try_fetch_accounts(
                             retry,
                             instance,
@@ -111,24 +115,16 @@ pub trait StateCatchup: Send + Sync {
                         .await
                         .map_err(|err| {
                             err.context(format!(
-                                "fetching accounts {accounts:?}, height {height}, view {view:?}"
+                                "fetching accounts {accounts:?}, height {height}, view {view}"
                             ))
-                        })?;
-                    accounts
-                        .iter()
-                        .map(|account| {
-                            FeeAccountProof::prove(&tree, (*account).into())
-                                .context(format!("missing account {account}"))
-                                .map(|(proof, _)| proof)
                         })
-                        .collect::<anyhow::Result<Vec<FeeAccountProof>>>()
                 }
                 .boxed()
             })
             .await
     }
 
-    /// Try to fetch and remember the blocks frontier, failing without retrying if unable.
+    /// Fetch and remember the blocks frontier without retrying on transient errors.
     async fn try_remember_blocks_merkle_tree(
         &self,
         retry: usize,
@@ -149,18 +145,20 @@ pub trait StateCatchup: Send + Sync {
         self.backoff()
             .retry(mt, |mt, retry| {
                 self.try_remember_blocks_merkle_tree(retry, instance, height, view, mt)
-                    .map_err(|err| err.context("fetching frontier"))
+                    .map_err(|err| err.context(format!("fetching frontier using {}", self.name())))
                     .boxed()
             })
             .await
     }
 
+    /// Fetch the chain config without retrying on transient errors.
     async fn try_fetch_chain_config(
         &self,
         retry: usize,
         commitment: Commitment<ChainConfig>,
     ) -> anyhow::Result<ChainConfig>;
 
+    /// Fetch the chain config, retrying on transient errors.
     async fn fetch_chain_config(
         &self,
         commitment: Commitment<ChainConfig>,
@@ -175,32 +173,32 @@ pub trait StateCatchup: Send + Sync {
             .await
     }
 
-    /// Try to fetch the given accounts state, failing without retrying if unable.
-    async fn try_fetch_reward_accounts(
+    /// Fetch the given list of reward accounts without retrying on transient errors.
+    async fn try_fetch_reward_accounts_v2(
         &self,
         retry: usize,
         instance: &NodeState,
         height: u64,
         view: ViewNumber,
-        reward_merkle_tree_root: RewardMerkleCommitment,
-        account: &[RewardAccount],
-    ) -> anyhow::Result<RewardMerkleTree>;
+        reward_merkle_tree_root: RewardMerkleCommitmentV2,
+        accounts: &[RewardAccountV2],
+    ) -> anyhow::Result<Vec<RewardAccountProofV2>>;
 
-    /// Fetch the given list of accounts, retrying on transient errors.
-    async fn fetch_reward_accounts(
+    /// Fetch the given list of reward accounts, retrying on transient errors.
+    async fn fetch_reward_accounts_v2(
         &self,
         instance: &NodeState,
         height: u64,
         view: ViewNumber,
-        reward_merkle_tree_root: RewardMerkleCommitment,
-        accounts: Vec<RewardAccount>,
-    ) -> anyhow::Result<Vec<RewardAccountProof>> {
+        reward_merkle_tree_root: RewardMerkleCommitmentV2,
+        accounts: Vec<RewardAccountV2>,
+    ) -> anyhow::Result<Vec<RewardAccountProofV2>> {
         self.backoff()
             .retry(self, |provider, retry| {
                 let accounts = &accounts;
                 async move {
-                    let tree = provider
-                        .try_fetch_reward_accounts(
+                    provider
+                        .try_fetch_reward_accounts_v2(
                             retry,
                             instance,
                             height,
@@ -211,170 +209,90 @@ pub trait StateCatchup: Send + Sync {
                         .await
                         .map_err(|err| {
                             err.context(format!(
-                                "fetching reward accounts {accounts:?}, height {height}, view {view:?}"
+                                "fetching reward accounts {accounts:?}, height {height}, view \
+                                 {view}"
                             ))
-                        })?;
-                    accounts
-                        .iter()
-                        .map(|account| {
-                            RewardAccountProof::prove(&tree, (*account).into())
-                                .context(format!("missing reward account {account}"))
-                                .map(|(proof, _)| proof)
                         })
-                        .collect::<anyhow::Result<Vec<RewardAccountProof>>>()
                 }
                 .boxed()
             })
             .await
     }
 
+    /// Fetch the given list of reward accounts without retrying on transient errors.
+    async fn try_fetch_reward_accounts_v1(
+        &self,
+        retry: usize,
+        instance: &NodeState,
+        height: u64,
+        view: ViewNumber,
+        reward_merkle_tree_root: RewardMerkleCommitmentV1,
+        accounts: &[RewardAccountV1],
+    ) -> anyhow::Result<Vec<RewardAccountProofV1>>;
+
+    /// Fetch the given list of reward accounts, retrying on transient errors.
+    async fn fetch_reward_accounts_v1(
+        &self,
+        instance: &NodeState,
+        height: u64,
+        view: ViewNumber,
+        reward_merkle_tree_root: RewardMerkleCommitmentV1,
+        accounts: Vec<RewardAccountV1>,
+    ) -> anyhow::Result<Vec<RewardAccountProofV1>> {
+        self.backoff()
+            .retry(self, |provider, retry| {
+                let accounts = &accounts;
+                async move {
+                    provider
+                        .try_fetch_reward_accounts_v1(
+                            retry,
+                            instance,
+                            height,
+                            view,
+                            reward_merkle_tree_root,
+                            accounts,
+                        )
+                        .await
+                        .map_err(|err| {
+                            err.context(format!(
+                                "fetching v1 reward accounts {accounts:?}, height {height}, view \
+                                 {view}"
+                            ))
+                        })
+                }
+                .boxed()
+            })
+            .await
+    }
+
+    /// Returns true if the catchup provider is local (e.g. does not make calls to remote resources).
+    fn is_local(&self) -> bool;
+
+    /// Returns the backoff parameters for the catchup provider.
     fn backoff(&self) -> &BackoffParams;
+
+    /// Returns the name of the catchup provider.
     fn name(&self) -> String;
 }
 
 #[async_trait]
-impl<T: StateCatchup + ?Sized> StateCatchup for Box<T> {
-    async fn try_fetch_leaves(&self, retry: usize, height: u64) -> anyhow::Result<Vec<Leaf2>> {
-        (**self).try_fetch_leaves(retry, height).await
-    }
-
-    async fn fetch_leaf(
-        &self,
-        height: u64,
-        stake_table: Vec<PeerConfig<SeqTypes>>,
-        success_threshold: U256,
-    ) -> anyhow::Result<Leaf2> {
-        (**self)
-            .fetch_leaf(height, stake_table, success_threshold)
-            .await
-    }
-    async fn try_fetch_accounts(
-        &self,
-        retry: usize,
-        instance: &NodeState,
-        height: u64,
-        view: ViewNumber,
-        fee_merkle_tree_root: FeeMerkleCommitment,
-        accounts: &[FeeAccount],
-    ) -> anyhow::Result<FeeMerkleTree> {
-        (**self)
-            .try_fetch_accounts(
-                retry,
-                instance,
-                height,
-                view,
-                fee_merkle_tree_root,
-                accounts,
-            )
-            .await
-    }
-
-    async fn fetch_accounts(
-        &self,
-        instance: &NodeState,
-        height: u64,
-        view: ViewNumber,
-        fee_merkle_tree_root: FeeMerkleCommitment,
-        accounts: Vec<FeeAccount>,
-    ) -> anyhow::Result<Vec<FeeAccountProof>> {
-        (**self)
-            .fetch_accounts(instance, height, view, fee_merkle_tree_root, accounts)
-            .await
-    }
-
-    async fn try_remember_blocks_merkle_tree(
-        &self,
-        retry: usize,
-        instance: &NodeState,
-        height: u64,
-        view: ViewNumber,
-        mt: &mut BlockMerkleTree,
-    ) -> anyhow::Result<()> {
-        (**self)
-            .try_remember_blocks_merkle_tree(retry, instance, height, view, mt)
-            .await
-    }
-
-    async fn remember_blocks_merkle_tree(
-        &self,
-        instance: &NodeState,
-        height: u64,
-        view: ViewNumber,
-        mt: &mut BlockMerkleTree,
-    ) -> anyhow::Result<()> {
-        (**self)
-            .remember_blocks_merkle_tree(instance, height, view, mt)
-            .await
-    }
-
-    async fn try_fetch_chain_config(
-        &self,
-        retry: usize,
-        commitment: Commitment<ChainConfig>,
-    ) -> anyhow::Result<ChainConfig> {
-        (**self).try_fetch_chain_config(retry, commitment).await
-    }
-
-    async fn fetch_chain_config(
-        &self,
-        commitment: Commitment<ChainConfig>,
-    ) -> anyhow::Result<ChainConfig> {
-        (**self).fetch_chain_config(commitment).await
-    }
-
-    async fn try_fetch_reward_accounts(
-        &self,
-        retry: usize,
-        instance: &NodeState,
-        height: u64,
-        view: ViewNumber,
-        reward_merkle_tree_root: RewardMerkleCommitment,
-        accounts: &[RewardAccount],
-    ) -> anyhow::Result<RewardMerkleTree> {
-        (**self)
-            .try_fetch_reward_accounts(
-                retry,
-                instance,
-                height,
-                view,
-                reward_merkle_tree_root,
-                accounts,
-            )
-            .await
-    }
-
-    async fn fetch_reward_accounts(
-        &self,
-        instance: &NodeState,
-        height: u64,
-        view: ViewNumber,
-        reward_merkle_tree_root: RewardMerkleCommitment,
-        accounts: Vec<RewardAccount>,
-    ) -> anyhow::Result<Vec<RewardAccountProof>> {
-        (**self)
-            .fetch_reward_accounts(instance, height, view, reward_merkle_tree_root, accounts)
-            .await
-    }
-
-    fn backoff(&self) -> &BackoffParams {
-        (**self).backoff()
-    }
-
-    fn name(&self) -> String {
-        (**self).name()
-    }
-}
-
-#[async_trait]
 impl<T: StateCatchup + ?Sized> StateCatchup for Arc<T> {
-    async fn try_fetch_leaves(&self, retry: usize, height: u64) -> anyhow::Result<Vec<Leaf2>> {
-        (**self).try_fetch_leaves(retry, height).await
+    async fn try_fetch_leaf(
+        &self,
+        retry: usize,
+        height: u64,
+        stake_table: HSStakeTable<SeqTypes>,
+        success_threshold: U256,
+    ) -> anyhow::Result<Leaf2> {
+        (**self)
+            .try_fetch_leaf(retry, height, stake_table, success_threshold)
+            .await
     }
 
     async fn fetch_leaf(
         &self,
         height: u64,
-        stake_table: Vec<PeerConfig<SeqTypes>>,
+        stake_table: HSStakeTable<SeqTypes>,
         success_threshold: U256,
     ) -> anyhow::Result<Leaf2> {
         (**self)
@@ -389,7 +307,7 @@ impl<T: StateCatchup + ?Sized> StateCatchup for Arc<T> {
         view: ViewNumber,
         fee_merkle_tree_root: FeeMerkleCommitment,
         accounts: &[FeeAccount],
-    ) -> anyhow::Result<FeeMerkleTree> {
+    ) -> anyhow::Result<Vec<FeeAccountProof>> {
         (**self)
             .try_fetch_accounts(
                 retry,
@@ -455,17 +373,17 @@ impl<T: StateCatchup + ?Sized> StateCatchup for Arc<T> {
         (**self).fetch_chain_config(commitment).await
     }
 
-    async fn try_fetch_reward_accounts(
+    async fn try_fetch_reward_accounts_v2(
         &self,
         retry: usize,
         instance: &NodeState,
         height: u64,
         view: ViewNumber,
-        reward_merkle_tree_root: RewardMerkleCommitment,
-        accounts: &[RewardAccount],
-    ) -> anyhow::Result<RewardMerkleTree> {
+        reward_merkle_tree_root: RewardMerkleCommitmentV2,
+        accounts: &[RewardAccountV2],
+    ) -> anyhow::Result<Vec<RewardAccountProofV2>> {
         (**self)
-            .try_fetch_reward_accounts(
+            .try_fetch_reward_accounts_v2(
                 retry,
                 instance,
                 height,
@@ -476,16 +394,50 @@ impl<T: StateCatchup + ?Sized> StateCatchup for Arc<T> {
             .await
     }
 
-    async fn fetch_reward_accounts(
+    async fn fetch_reward_accounts_v2(
         &self,
         instance: &NodeState,
         height: u64,
         view: ViewNumber,
-        reward_merkle_tree_root: RewardMerkleCommitment,
-        accounts: Vec<RewardAccount>,
-    ) -> anyhow::Result<Vec<RewardAccountProof>> {
+        reward_merkle_tree_root: RewardMerkleCommitmentV2,
+        accounts: Vec<RewardAccountV2>,
+    ) -> anyhow::Result<Vec<RewardAccountProofV2>> {
         (**self)
-            .fetch_reward_accounts(instance, height, view, reward_merkle_tree_root, accounts)
+            .fetch_reward_accounts_v2(instance, height, view, reward_merkle_tree_root, accounts)
+            .await
+    }
+
+    async fn try_fetch_reward_accounts_v1(
+        &self,
+        retry: usize,
+        instance: &NodeState,
+        height: u64,
+        view: ViewNumber,
+        reward_merkle_tree_root: RewardMerkleCommitmentV1,
+        accounts: &[RewardAccountV1],
+    ) -> anyhow::Result<Vec<RewardAccountProofV1>> {
+        (**self)
+            .try_fetch_reward_accounts_v1(
+                retry,
+                instance,
+                height,
+                view,
+                reward_merkle_tree_root,
+                accounts,
+            )
+            .await
+    }
+
+    async fn fetch_reward_accounts_v1(
+        &self,
+        instance: &NodeState,
+        height: u64,
+        view: ViewNumber,
+        reward_merkle_tree_root: RewardMerkleCommitmentV1,
+        accounts: Vec<RewardAccountV1>,
+    ) -> anyhow::Result<Vec<RewardAccountProofV1>> {
+        (**self)
+            .fetch_reward_accounts_v1(instance, height, view, reward_merkle_tree_root, accounts)
             .await
     }
 
@@ -496,165 +448,27 @@ impl<T: StateCatchup + ?Sized> StateCatchup for Arc<T> {
     fn name(&self) -> String {
         (**self).name()
     }
-}
 
-/// Catchup from multiple providers tries each provider in a round robin fashion until it succeeds.
-#[async_trait]
-impl<T: StateCatchup> StateCatchup for Vec<T> {
-    async fn try_fetch_leaves(&self, retry: usize, height: u64) -> anyhow::Result<Vec<Leaf2>> {
-        for provider in self {
-            match provider.try_fetch_leaves(retry, height).await {
-                Ok(leaves) => return Ok(leaves),
-                Err(err) => {
-                    tracing::info!(
-                        provider = provider.name(),
-                        "failed to fetch leaves: {err:#}"
-                    );
-                },
-            }
-        }
-
-        bail!("could not fetch leaves from any provider");
-    }
-    #[tracing::instrument(skip(self, instance))]
-    async fn try_fetch_accounts(
-        &self,
-        retry: usize,
-        instance: &NodeState,
-        height: u64,
-        view: ViewNumber,
-        fee_merkle_tree_root: FeeMerkleCommitment,
-        accounts: &[FeeAccount],
-    ) -> anyhow::Result<FeeMerkleTree> {
-        for provider in self {
-            match provider
-                .try_fetch_accounts(
-                    retry,
-                    instance,
-                    height,
-                    view,
-                    fee_merkle_tree_root,
-                    accounts,
-                )
-                .await
-            {
-                Ok(tree) => return Ok(tree),
-                Err(err) => {
-                    tracing::info!(
-                        ?accounts,
-                        provider = provider.name(),
-                        "failed to fetch accounts: {err:#}"
-                    );
-                },
-            }
-        }
-
-        bail!("could not fetch account from any provider");
-    }
-
-    #[tracing::instrument(skip(self, instance, mt))]
-    async fn try_remember_blocks_merkle_tree(
-        &self,
-        retry: usize,
-        instance: &NodeState,
-        height: u64,
-        view: ViewNumber,
-        mt: &mut BlockMerkleTree,
-    ) -> anyhow::Result<()> {
-        for provider in self {
-            match provider
-                .try_remember_blocks_merkle_tree(retry, instance, height, view, mt)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(err) => {
-                    tracing::info!(
-                        provider = provider.name(),
-                        "failed to fetch frontier: {err:#}"
-                    );
-                },
-            }
-        }
-
-        bail!("could not fetch account from any provider");
-    }
-
-    async fn try_fetch_chain_config(
-        &self,
-        retry: usize,
-        commitment: Commitment<ChainConfig>,
-    ) -> anyhow::Result<ChainConfig> {
-        for provider in self {
-            match provider.try_fetch_chain_config(retry, commitment).await {
-                Ok(cf) => return Ok(cf),
-                Err(err) => {
-                    tracing::info!(
-                        provider = provider.name(),
-                        "failed to fetch chain config: {err:#}"
-                    );
-                },
-            }
-        }
-
-        bail!("could not fetch chain config from any provider");
-    }
-
-    #[tracing::instrument(skip(self, instance))]
-    async fn try_fetch_reward_accounts(
-        &self,
-        retry: usize,
-        instance: &NodeState,
-        height: u64,
-        view: ViewNumber,
-        reward_merkle_tree_root: RewardMerkleCommitment,
-        accounts: &[RewardAccount],
-    ) -> anyhow::Result<RewardMerkleTree> {
-        for provider in self {
-            match provider
-                .try_fetch_reward_accounts(
-                    retry,
-                    instance,
-                    height,
-                    view,
-                    reward_merkle_tree_root,
-                    accounts,
-                )
-                .await
-            {
-                Ok(tree) => return Ok(tree),
-                Err(err) => {
-                    tracing::info!(
-                        ?accounts,
-                        provider = provider.name(),
-                        "failed to fetch reward accounts: {err:#}"
-                    );
-                },
-            }
-        }
-
-        bail!("could not fetch account from any provider");
-    }
-
-    fn backoff(&self) -> &BackoffParams {
-        // Use whichever provider's backoff is most conservative.
-        self.iter()
-            .map(|p| p.backoff())
-            .max()
-            .expect("provider list not empty")
-    }
-
-    fn name(&self) -> String {
-        format!("[{}]", self.iter().map(StateCatchup::name).join(","))
+    fn is_local(&self) -> bool {
+        (**self).is_local()
     }
 }
 
 #[async_trait]
-pub trait PersistenceOptions: Clone + Send + Sync + 'static {
+pub trait PersistenceOptions: Clone + Send + Sync + Debug + 'static {
     type Persistence: SequencerPersistence + MembershipPersistence;
 
     fn set_view_retention(&mut self, view_retention: u64);
     async fn create(&mut self) -> anyhow::Result<Self::Persistence>;
     async fn reset(self) -> anyhow::Result<()>;
+}
+
+/// Determine the read state based on the queried block range.
+// - If the persistence returned events up to the requested block, the read is complete.
+/// - Otherwise, indicate that the read is up to the last processed block.
+pub enum EventsPersistenceRead {
+    Complete,
+    UntilL1Block(u64),
 }
 
 #[async_trait]
@@ -664,7 +478,7 @@ pub trait MembershipPersistence: Send + Sync + 'static {
     async fn load_stake(
         &self,
         epoch: EpochNumber,
-    ) -> anyhow::Result<Option<IndexMap<alloy::primitives::Address, Validator<BLSPubKey>>>>;
+    ) -> anyhow::Result<Option<(ValidatorMap, Option<RewardAmount>)>>;
 
     /// Load stake tables for storage for latest `n` known epochs
     async fn load_latest_stake(&self, limit: u64) -> anyhow::Result<Option<Vec<IndexedStake>>>;
@@ -673,12 +487,28 @@ pub trait MembershipPersistence: Send + Sync + 'static {
     async fn store_stake(
         &self,
         epoch: EpochNumber,
-        stake: IndexMap<alloy::primitives::Address, Validator<BLSPubKey>>,
+        stake: ValidatorMap,
+        block_reward: Option<RewardAmount>,
     ) -> anyhow::Result<()>;
+
+    async fn store_events(
+        &self,
+        l1_finalized: u64,
+        events: Vec<(EventKey, StakeTableEvent)>,
+    ) -> anyhow::Result<()>;
+    async fn load_events(
+        &self,
+        l1_finalized: u64,
+    ) -> anyhow::Result<(
+        Option<EventsPersistenceRead>,
+        Vec<(EventKey, StakeTableEvent)>,
+    )>;
 }
 
 #[async_trait]
-pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
+pub trait SequencerPersistence:
+    Sized + Send + Sync + Clone + 'static + DhtPersistentStorage
+{
     /// Use this storage as a state catchup backend, if supported.
     fn into_catchup_provider(
         self,
@@ -698,6 +528,9 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
 
     /// Load the highest view saved with [`save_voted_view`](Self::save_voted_view).
     async fn load_latest_acted_view(&self) -> anyhow::Result<Option<ViewNumber>>;
+
+    /// Load the view to restart from.
+    async fn load_restart_view(&self) -> anyhow::Result<Option<ViewNumber>>;
 
     /// Load the proposals saved by consensus
     async fn load_quorum_proposals(
@@ -723,7 +556,7 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
     async fn load_start_epoch_info(&self) -> anyhow::Result<Vec<InitializerEpochInfo<SeqTypes>>>;
     async fn load_state_cert(
         &self,
-    ) -> anyhow::Result<Option<LightClientStateUpdateCertificate<SeqTypes>>>;
+    ) -> anyhow::Result<Option<LightClientStateUpdateCertificateV2<SeqTypes>>>;
 
     /// Load the latest known consensus state.
     ///
@@ -742,7 +575,7 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
             .context("loading last voted view")?
         {
             Some(view) => {
-                tracing::info!(?view, "starting from saved view");
+                tracing::info!(?view, "starting with last actioned view");
                 view
             },
             None => {
@@ -751,6 +584,20 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
             },
         };
 
+        let restart_view = match self
+            .load_restart_view()
+            .await
+            .context("loading restart view")?
+        {
+            Some(view) => {
+                tracing::info!(?view, "starting from saved view");
+                view
+            },
+            None => {
+                tracing::info!("no saved view, starting from genesis");
+                ViewNumber::genesis()
+            },
+        };
         let next_epoch_high_qc = self
             .load_next_epoch_quorum_certificate()
             .await
@@ -765,7 +612,7 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
                 ensure!(
                     leaf.view_number() == high_qc.view_number,
                     format!(
-                        "loaded anchor leaf from view {:?}, but high QC is from view {:?}",
+                        "loaded anchor leaf from view {}, but high QC is from view {}",
                         leaf.view_number(),
                         high_qc.view_number
                     )
@@ -786,18 +633,18 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
         };
         let validated_state = if leaf.block_header().height() == 0 {
             // If we are starting from genesis, we can provide the full state.
-            Some(Arc::new(genesis_validated_state))
+            genesis_validated_state
         } else {
             // Otherwise, we will have to construct a sparse state and fetch missing data during
             // catchup.
-            None
+            ValidatedState::from_header(leaf.block_header())
         };
 
         // If we are not starting from genesis, we start from the view following the maximum view
         // between `highest_voted_view` and `leaf.view_number`. This prevents double votes from
         // starting in a view in which we had already voted before the restart, and prevents
         // unnecessary catchup from starting in a view earlier than the anchor leaf.
-        let view = max(highest_voted_view, leaf.view_number());
+        let restart_view = max(restart_view, leaf.view_number());
         // TODO:
         let epoch = genesis_epoch_from_version::<V, SeqTypes>();
 
@@ -829,12 +676,11 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
         let state_cert = self
             .load_state_cert()
             .await
-            .context("loading light client state update certificate")?
-            .unwrap_or(LightClientStateUpdateCertificate::genesis());
+            .context("loading light client state update certificate")?;
 
         tracing::info!(
             ?leaf,
-            ?view,
+            ?restart_view,
             ?epoch,
             ?high_qc,
             ?validated_state,
@@ -848,9 +694,9 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
                 epoch_height,
                 epoch_start_block,
                 anchor_leaf: leaf,
-                anchor_state: validated_state.unwrap_or_default(),
+                anchor_state: Arc::new(validated_state),
                 anchor_state_delta: None,
-                start_view: view,
+                start_view: restart_view,
                 start_epoch: epoch,
                 last_actioned_view: highest_voted_view,
                 saved_proposals,
@@ -1009,20 +855,24 @@ pub trait SequencerPersistence: Sized + Send + Sync + Clone + 'static {
         self.append_quorum_proposal2(proposal).await
     }
 
-    async fn add_drb_result(
+    async fn store_drb_result(
         &self,
         epoch: <SeqTypes as NodeType>::Epoch,
         drb_result: DrbResult,
     ) -> anyhow::Result<()>;
-    async fn add_epoch_root(
+    async fn store_drb_input(&self, drb_input: DrbInput) -> anyhow::Result<()>;
+    async fn load_drb_input(&self, epoch: u64) -> anyhow::Result<DrbInput>;
+    async fn store_epoch_root(
         &self,
         epoch: <SeqTypes as NodeType>::Epoch,
         block_header: <SeqTypes as NodeType>::BlockHeader,
     ) -> anyhow::Result<()>;
     async fn add_state_cert(
         &self,
-        state_cert: LightClientStateUpdateCertificate<SeqTypes>,
+        state_cert: LightClientStateUpdateCertificateV2<SeqTypes>,
     ) -> anyhow::Result<()>;
+
+    fn enable_metrics(&mut self, metrics: &dyn Metrics);
 }
 
 #[async_trait]
@@ -1126,25 +976,33 @@ impl<P: SequencerPersistence> Storage<SeqTypes> for Arc<P> {
             .await
     }
 
-    async fn add_drb_result(
+    async fn store_drb_result(
         &self,
         epoch: <SeqTypes as NodeType>::Epoch,
         drb_result: DrbResult,
     ) -> anyhow::Result<()> {
-        (**self).add_drb_result(epoch, drb_result).await
+        (**self).store_drb_result(epoch, drb_result).await
     }
 
-    async fn add_epoch_root(
+    async fn store_epoch_root(
         &self,
         epoch: <SeqTypes as NodeType>::Epoch,
         block_header: <SeqTypes as NodeType>::BlockHeader,
     ) -> anyhow::Result<()> {
-        (**self).add_epoch_root(epoch, block_header).await
+        (**self).store_epoch_root(epoch, block_header).await
+    }
+
+    async fn store_drb_input(&self, drb_input: DrbInput) -> anyhow::Result<()> {
+        (**self).store_drb_input(drb_input).await
+    }
+
+    async fn load_drb_input(&self, epoch: u64) -> anyhow::Result<DrbInput> {
+        (**self).load_drb_input(epoch).await
     }
 
     async fn update_state_cert(
         &self,
-        state_cert: LightClientStateUpdateCertificate<SeqTypes>,
+        state_cert: LightClientStateUpdateCertificateV2<SeqTypes>,
     ) -> anyhow::Result<()> {
         (**self).add_state_cert(state_cert).await
     }

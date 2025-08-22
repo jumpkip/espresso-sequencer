@@ -30,7 +30,7 @@ use snafu::{ResultExt, Snafu};
 use tide_disco::{api::ApiError, method::ReadState, Api, RequestError, StatusCode};
 use vbs::version::StaticVersionType;
 
-use crate::{api::load_api, QueryError};
+use crate::{api::load_api, availability::QueryableHeader, Header, QueryError};
 
 pub(crate) mod data_source;
 pub(crate) mod query_data;
@@ -86,6 +86,7 @@ pub enum Error {
         start: String,
         end: u64,
     },
+    #[snafu(display("error {status}: {message}"))]
     Custom {
         message: String,
         status: StatusCode,
@@ -111,11 +112,14 @@ impl Error {
     }
 }
 
-pub fn define_api<State, Types: NodeType, Ver: StaticVersionType + 'static>(
+pub fn define_api<State, Types, Ver: StaticVersionType + 'static>(
     options: &Options,
     _: Ver,
+    api_ver: semver::Version,
 ) -> Result<Api<State, Error, Ver>, ApiError>
 where
+    Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     State: 'static + Send + Sync + ReadState,
     <State as ReadState>::State: NodeDataSource<Types> + Send + Sync,
 {
@@ -125,7 +129,7 @@ where
         options.extensions.clone(),
     )?;
     let window_limit = options.window_limit;
-    api.with_version("0.0.1".parse().unwrap())
+    api.with_version(api_ver)
         .get("block_height", |_req, state| {
             async move { state.block_height().await.context(QuerySnafu) }.boxed()
         })?
@@ -139,7 +143,12 @@ where
                     Some(to) => Bound::Included(to),
                     None => Bound::Unbounded,
                 };
-                Ok(state.count_transactions_in_range((from, to)).await?)
+
+                let ns = req.opt_integer_param::<_, i64>("namespace")?;
+
+                Ok(state
+                    .count_transactions_in_range((from, to), ns.map(Into::into))
+                    .await?)
             }
             .boxed()
         })?
@@ -153,7 +162,12 @@ where
                     Some(to) => Bound::Included(to),
                     None => Bound::Unbounded,
                 };
-                Ok(state.payload_size_in_range((from, to)).await?)
+
+                let ns = req.opt_integer_param::<_, i64>("namespace")?;
+
+                Ok(state
+                    .payload_size_in_range((from, to), ns.map(Into::into))
+                    .await?)
             }
             .boxed()
         })?
@@ -230,15 +244,12 @@ mod test {
         testing::{
             consensus::{MockDataSource, MockNetwork, MockSqlDataSource},
             mocks::{mock_transaction, MockBase, MockTypes, MockVersions},
-            setup_test,
         },
         ApiState, Error, Header,
     };
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_api() {
-        setup_test();
-
         let window_limit = 78;
 
         // Create the consensus network.
@@ -257,18 +268,19 @@ mod test {
                     ..Default::default()
                 },
                 MockBase::instance(),
+                "1.0.0".parse().unwrap(),
             )
             .unwrap(),
         )
         .unwrap();
         network.spawn(
             "server",
-            app.serve(format!("0.0.0.0:{}", port), MockBase::instance()),
+            app.serve(format!("0.0.0.0:{port}"), MockBase::instance()),
         );
 
         // Start a client.
         let client = Client::<Error, MockBase>::new(
-            format!("http://localhost:{}/node", port).parse().unwrap(),
+            format!("http://localhost:{port}/node").parse().unwrap(),
         );
         assert!(client.connect(Some(Duration::from_secs(60))).await);
 
@@ -416,10 +428,8 @@ mod test {
         network.shut_down().await;
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_aggregate_ranges() {
-        setup_test();
-
         // Create the consensus network.
         let mut network = MockNetwork::<MockSqlDataSource, MockVersions>::init().await;
         let mut events = network.handle().event_stream();
@@ -430,17 +440,22 @@ mod test {
         let mut app = App::<_, Error>::with_state(ApiState::from(network.data_source()));
         app.register_module(
             "node",
-            define_api(&Default::default(), MockBase::instance()).unwrap(),
+            define_api(
+                &Default::default(),
+                MockBase::instance(),
+                "1.0.0".parse().unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap();
         network.spawn(
             "server",
-            app.serve(format!("0.0.0.0:{}", port), MockBase::instance()),
+            app.serve(format!("0.0.0.0:{port}"), MockBase::instance()),
         );
 
         // Start a client.
         let client =
-            Client::<Error, MockBase>::new(format!("http://localhost:{}", port).parse().unwrap());
+            Client::<Error, MockBase>::new(format!("http://localhost:{port}").parse().unwrap());
         assert!(client.connect(Some(Duration::from_secs(60))).await);
 
         // Wait until a few transactions have been sequenced.
@@ -575,10 +590,8 @@ mod test {
         network.shut_down().await;
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_extensions() {
-        setup_test();
-
         let dir = TempDir::with_prefix("test_node_extensions").unwrap();
         let data_source = ExtensibleDataSource::new(
             MockDataSource::create(dir.path(), Default::default())
@@ -606,6 +619,7 @@ mod test {
                     ..Default::default()
                 },
                 MockBase::instance(),
+                "1.0.0".parse().unwrap(),
             )
             .unwrap();
         api.get("get_ext", |_, state| {
@@ -627,11 +641,11 @@ mod test {
         let port = pick_unused_port().unwrap();
         let _server = BackgroundTask::spawn(
             "server",
-            app.serve(format!("0.0.0.0:{}", port), MockBase::instance()),
+            app.serve(format!("0.0.0.0:{port}"), MockBase::instance()),
         );
 
         let client = Client::<Error, MockBase>::new(
-            format!("http://localhost:{}/node", port).parse().unwrap(),
+            format!("http://localhost:{port}/node").parse().unwrap(),
         );
         assert!(client.connect(Some(Duration::from_secs(60))).await);
 

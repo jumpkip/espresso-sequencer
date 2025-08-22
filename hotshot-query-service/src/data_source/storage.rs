@@ -58,17 +58,17 @@
 
 use std::ops::RangeBounds;
 
+use alloy::primitives::map::HashMap;
 use async_trait::async_trait;
 use futures::future::Future;
 use hotshot_types::{data::VidShare, traits::node_implementation::NodeType};
 use jf_merkle_tree::prelude::MerkleProof;
 use tagged_base64::TaggedBase64;
-use vec1::Vec1;
 
 use crate::{
     availability::{
-        BlockId, BlockQueryData, LeafId, LeafQueryData, PayloadMetadata, PayloadQueryData,
-        QueryableHeader, QueryablePayload, TransactionHash, TransactionQueryData,
+        BlockId, BlockQueryData, LeafId, LeafQueryData, NamespaceId, PayloadMetadata,
+        PayloadQueryData, QueryableHeader, QueryablePayload, StateCertQueryDataV2, TransactionHash,
         VidCommonMetadata, VidCommonQueryData,
     },
     explorer::{
@@ -117,10 +117,10 @@ pub use sql::SqlStorage;
 pub trait AvailabilityStorage<Types>: Send + Sync
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     async fn get_leaf(&mut self, id: LeafId<Types>) -> QueryResult<LeafQueryData<Types>>;
-    async fn get_leaves(&mut self, height: u64) -> QueryResult<Vec1<LeafQueryData<Types>>>;
     async fn get_block(&mut self, id: BlockId<Types>) -> QueryResult<BlockQueryData<Types>>;
     async fn get_header(&mut self, id: BlockId<Types>) -> QueryResult<Header<Types>>;
     async fn get_payload(&mut self, id: BlockId<Types>) -> QueryResult<PayloadQueryData<Types>>;
@@ -188,13 +188,15 @@ where
     where
         R: RangeBounds<usize> + Send + 'static;
 
-    async fn get_transaction(
+    async fn get_block_with_transaction(
         &mut self,
         hash: TransactionHash<Types>,
-    ) -> QueryResult<TransactionQueryData<Types>>;
+    ) -> QueryResult<BlockQueryData<Types>>;
 
     /// Get the first leaf which is available in the database with height >= `from`.
     async fn first_available_leaf(&mut self, from: u64) -> QueryResult<LeafQueryData<Types>>;
+
+    async fn get_state_cert(&mut self, epoch: u64) -> QueryResult<StateCertQueryDataV2<Types>>;
 }
 
 pub trait UpdateAvailabilityStorage<Types>
@@ -214,18 +216,28 @@ where
         common: VidCommonQueryData<Types>,
         share: Option<VidShare>,
     ) -> impl Send + Future<Output = anyhow::Result<()>>;
+    fn insert_state_cert(
+        &mut self,
+        state_cert: StateCertQueryDataV2<Types>,
+    ) -> impl Send + Future<Output = anyhow::Result<()>>;
 }
 
 #[async_trait]
-pub trait NodeStorage<Types: NodeType> {
+pub trait NodeStorage<Types>
+where
+    Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
+{
     async fn block_height(&mut self) -> QueryResult<usize>;
     async fn count_transactions_in_range(
         &mut self,
         range: impl RangeBounds<usize> + Send,
+        namespace: Option<NamespaceId<Types>>,
     ) -> QueryResult<usize>;
     async fn payload_size_in_range(
         &mut self,
         range: impl RangeBounds<usize> + Send,
+        namespace: Option<NamespaceId<Types>>,
     ) -> QueryResult<usize>;
     async fn vid_share<ID>(&mut self, id: ID) -> QueryResult<VidShare>
     where
@@ -242,32 +254,40 @@ pub trait NodeStorage<Types: NodeType> {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Aggregate {
+pub struct Aggregate<Types: NodeType>
+where
+    Header<Types>: QueryableHeader<Types>,
+{
     pub height: i64,
-    pub num_transactions: i64,
-    pub payload_size: i64,
+    pub num_transactions: HashMap<Option<NamespaceId<Types>>, usize>,
+    pub payload_size: HashMap<Option<NamespaceId<Types>>, usize>,
 }
 
-pub trait AggregatesStorage {
+pub trait AggregatesStorage<Types>
+where
+    Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
+{
     /// The block height for which aggregate statistics are currently available.
     fn aggregates_height(&mut self) -> impl Future<Output = anyhow::Result<usize>> + Send;
 
     /// the last aggregate
     fn load_prev_aggregate(
         &mut self,
-    ) -> impl Future<Output = anyhow::Result<Option<Aggregate>>> + Send;
+    ) -> impl Future<Output = anyhow::Result<Option<Aggregate<Types>>>> + Send;
 }
 
 pub trait UpdateAggregatesStorage<Types>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
 {
     /// Update aggregate statistics based on a new block.
     fn update_aggregates(
         &mut self,
-        aggregate: Aggregate,
+        aggregate: Aggregate<Types>,
         blocks: &[PayloadMetadata<Types>],
-    ) -> impl Future<Output = anyhow::Result<Aggregate>> + Send;
+    ) -> impl Future<Output = anyhow::Result<Aggregate<Types>>> + Send;
 }
 
 /// An interface for querying Data and Statistics from the HotShot Blockchain.
@@ -284,7 +304,7 @@ pub trait ExplorerStorage<Types>
 where
     Types: NodeType,
     Header<Types>: ExplorerHeader<Types> + QueryableHeader<Types>,
-    Transaction<Types>: ExplorerTransaction,
+    Transaction<Types>: ExplorerTransaction<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     /// `get_block_detail` is a method that retrieves the details of a specific

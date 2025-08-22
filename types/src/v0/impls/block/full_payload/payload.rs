@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use committable::Committable;
-use hotshot_query_service::availability::QueryablePayload;
+use hotshot_query_service::{
+    availability::{QueryablePayload, VidCommonQueryData},
+    VidCommon,
+};
 use hotshot_types::{
     data::ViewNumber,
     traits::{BlockPayload, EncodeBytes},
@@ -15,9 +18,9 @@ use thiserror::Error;
 
 use crate::{
     v0::impls::{NodeState, ValidatedState},
-    v0_1::ChainConfig,
+    v0_3::ChainConfig,
     Index, Iter, NamespaceId, NsIndex, NsPayload, NsPayloadBuilder, NsPayloadRange, NsTable,
-    NsTableBuilder, Payload, PayloadByteLen, SeqTypes, Transaction, TxProof,
+    NsTableBuilder, Payload, PayloadByteLen, SeqTypes, Transaction, TxIndex, TxProof,
 };
 
 #[derive(serde::Deserialize, serde::Serialize, Error, Debug, Eq, PartialEq)]
@@ -44,9 +47,10 @@ impl Payload {
     /// Like [`QueryablePayload::transaction_with_proof`] except without the
     /// proof.
     pub fn transaction(&self, index: &Index) -> Option<Transaction> {
-        let ns_id = self.ns_table.read_ns_id(index.ns())?;
-        let ns_payload = self.ns_payload(index.ns());
-        ns_payload.export_tx(&ns_id, index.tx())
+        let ns = &index.ns_index;
+        let ns_id = self.ns_table.read_ns_id(ns)?;
+        let ns_payload = self.ns_payload(ns);
+        ns_payload.export_tx(&ns_id, &TxIndex(index.position as usize))
     }
 
     // CRATE-VISIBLE HELPERS START HERE
@@ -79,7 +83,7 @@ impl Payload {
     > {
         // accounting for block byte length limit
         let max_block_byte_len = u64::from(chain_config.max_block_size);
-        let mut block_byte_len = NsTableBuilder::header_byte_len() as u64;
+        let mut block_byte_len = 0;
 
         // add each tx to its namespace
         let mut ns_builders = BTreeMap::<NamespaceId, NsPayloadBuilder>::new();
@@ -89,7 +93,8 @@ impl Payload {
             if tx_size > max_block_byte_len {
                 // skip this transaction since it exceeds the block size limit
                 tracing::warn!(
-                    "skip the transaction to fit in maximum block byte length {max_block_byte_len}, transaction size {tx_size}"
+                    "skip the transaction to fit in maximum block byte length \
+                     {max_block_byte_len}, transaction size {tx_size}"
                 );
                 continue;
             }
@@ -97,7 +102,10 @@ impl Payload {
             // accounting for block byte length limit
             block_byte_len += tx_size;
             if block_byte_len > max_block_byte_len {
-                tracing::warn!("transactions truncated to fit in maximum block byte length {max_block_byte_len}");
+                tracing::warn!(
+                    "transactions truncated to fit in maximum block byte length \
+                     {max_block_byte_len}"
+                );
                 break;
             }
 
@@ -148,7 +156,7 @@ impl BlockPayload<SeqTypes> for Payload {
             match validated_state_cf.resolve() {
                 Some(cf) => cf,
                 None => instance_state
-                    .peers
+                    .state_catchup
                     .as_ref()
                     .fetch_chain_config(validated_state_cf.commit())
                     .await
@@ -156,7 +164,7 @@ impl BlockPayload<SeqTypes> for Payload {
             }
         };
 
-        Self::from_transactions_sync(transactions, ChainConfig::from(chain_config))
+        Self::from_transactions_sync(transactions, chain_config)
     }
 
     // TODO avoid cloning the entire payload here?
@@ -201,12 +209,15 @@ impl BlockPayload<SeqTypes> for Payload {
     ) -> impl 'a + Iterator<Item = Self::Transaction> {
         self.enumerate(metadata).map(|(_, t)| t)
     }
+
+    fn txn_bytes(&self) -> usize {
+        self.raw_payload.len()
+    }
 }
 
 impl QueryablePayload<SeqTypes> for Payload {
     // TODO changes to QueryablePayload trait:
     // https://github.com/EspressoSystems/hotshot-query-service/issues/639
-    type TransactionIndex = Index;
     type Iter<'a> = Iter<'a>;
     type InclusionProof = TxProof;
 
@@ -221,31 +232,32 @@ impl QueryablePayload<SeqTypes> for Payload {
         Iter::new(self)
     }
 
-    fn transaction_with_proof(
-        &self,
-        _meta: &Self::Metadata,
-        index: &Self::TransactionIndex,
-    ) -> Option<(Self::Transaction, Self::InclusionProof)> {
-        // TODO HACK! THE RETURNED PROOF MIGHT FAIL VERIFICATION.
-        // https://github.com/EspressoSystems/hotshot-query-service/issues/639
-        //
-        // Need a `ADVZCommon` to proceed. Need to modify `QueryablePayload`
-        // trait to add a `ADVZCommon` arg. In the meantime tests fail if I leave
-        // it `todo!()`, so this hack allows tests to pass.
-        let common = hotshot_types::vid::advz::advz_scheme(10)
-            .disperse(&self.raw_payload)
-            .unwrap()
-            .common;
-
-        TxProof::new(index, self, &common)
+    fn transaction(&self, _meta: &Self::Metadata, index: &Index) -> Option<Self::Transaction> {
+        self.transaction(index)
     }
 
-    fn transaction(
+    fn transaction_proof(
         &self,
         _meta: &Self::Metadata,
-        index: &Self::TransactionIndex,
-    ) -> Option<Self::Transaction> {
-        self.transaction(index)
+        vid: &VidCommonQueryData<SeqTypes>,
+        index: &Index,
+    ) -> Option<Self::InclusionProof> {
+        let common = match vid.common() {
+            VidCommon::V0(common) => common,
+            VidCommon::V1(_) => {
+                // TODO HACK! THE RETURNED PROOF MIGHT FAIL VERIFICATION.
+                // https://github.com/EspressoSystems/hotshot-query-service/issues/639
+                //
+                // Need a `ADVZCommon` to proceed. Need to modify return type to accept either
+                // version of VID common and produce a proof from the corresponding version.
+                &hotshot_types::vid::advz::advz_scheme(10)
+                    .disperse(&self.raw_payload)
+                    .unwrap()
+                    .common
+            },
+        };
+        let proof = TxProof::new(index, self, common)?.1;
+        Some(proof)
     }
 }
 

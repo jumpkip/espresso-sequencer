@@ -166,7 +166,7 @@ impl ADVZNsProof {
 #[cfg(test)]
 mod tests {
     use futures::future;
-    use hotshot::{helpers::initialize_logging, traits::BlockPayload};
+    use hotshot::traits::BlockPayload;
     use hotshot_types::{
         data::VidCommitment,
         traits::EncodeBytes,
@@ -176,7 +176,7 @@ mod tests {
 
     use crate::{v0::impls::block::test::ValidTest, v0_1::ADVZNsProof, Payload};
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn ns_proof() {
         let test_cases = vec![
             vec![
@@ -189,8 +189,6 @@ mod tests {
             vec![vec![1, 2, 3], vec![4, 5, 6]],
             vec![],
         ];
-
-        initialize_logging();
 
         let mut rng = jf_utils::test_rng();
         let mut tests = ValidTest::many_from_tx_lengths(test_cases, &mut rng);
@@ -247,7 +245,7 @@ mod tests {
                 let txs = test
                     .nss
                     .remove(&ns_id)
-                    .unwrap_or_else(|| panic!("namespace {} missing from test", ns_id));
+                    .unwrap_or_else(|| panic!("namespace {ns_id} missing from test"));
 
                 // verify ns_proof
                 let (ns_proof_txs, ns_proof_ns_id) = ns_proof
@@ -256,7 +254,7 @@ mod tests {
                         &VidCommitment::V0(vid.commit),
                         &vid.common,
                     )
-                    .unwrap_or_else(|| panic!("namespace {} proof verification failure", ns_id));
+                    .unwrap_or_else(|| panic!("namespace {ns_id} proof verification failure"));
 
                 assert_eq!(ns_proof_ns_id, ns_id);
                 assert_eq!(ns_proof_txs, txs);

@@ -1,14 +1,14 @@
 pragma solidity ^0.8.0;
 
 import { SafeTransferLib, ERC20 } from "solmate/utils/SafeTransferLib.sol";
-import { OwnableUpgradeable } from
-    "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import { Initializable } from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import { UUPSUpgradeable } from
     "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import { OwnableUpgradeable } from
+    "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import { BN254 } from "bn254/BN254.sol";
 import { BLSSig } from "./libraries/BLSSig.sol";
-import { LightClient } from "../src/LightClient.sol";
+import { ILightClient } from "./interfaces/ILightClient.sol";
 import { EdOnBN254 } from "./libraries/EdOnBn254.sol";
 import { InitializedAt } from "./InitializedAt.sol";
 
@@ -54,8 +54,6 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
         EdOnBN254.EdOnBN254Point schnorrVk,
         uint16 commission
     );
-    // TODO: emit the BLS signature so GCL can verify it.
-    // TODO: emit the Schnorr signature so GCL can verify it.
 
     /// @notice A validator initiated an exit from stake table
     ///
@@ -93,8 +91,6 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
     event ConsensusKeysUpdated(
         address indexed account, BN254.G2Point blsVK, EdOnBN254.EdOnBN254Point schnorrVK
     );
-    // TODO: emit the BLS signature so GCL can verify it.
-    // TODO: emit the Schnorr signature so GCL can verify it.
 
     /// @notice A delegator claims unlocked funds.
     ///
@@ -140,6 +136,12 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
     /// Contract dependencies initialized with zero address.
     error ZeroAddress();
 
+    /// An undelegation already exists for this validator and delegator.
+    error UndelegationAlreadyExists();
+
+    /// A zero amount would lead to a no-op.
+    error ZeroAmount();
+
     // === Structs ===
 
     /// @notice Represents an Espresso validator and tracks funds currently delegated to them.
@@ -174,7 +176,7 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
     ///
     /// @dev Currently unused but will be used for slashing therefore already included in the
     /// contract.
-    LightClient public lightClient;
+    ILightClient public lightClient;
 
     /// The staking token contract.
     ERC20 public token;
@@ -194,14 +196,14 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
     mapping(address validator => uint256 unlocksAt) public validatorExits;
 
     /// Currently active delegation amounts.
-    mapping(address validator => mapping(address delegator => uint256 amount)) delegations;
+    mapping(address validator => mapping(address delegator => uint256 amount)) public delegations;
 
     /// Delegations held in escrow that are to be unlocked at a later time.
     //
     // @dev these are stored indexed by validator so we can keep track of them for slashing later
-    mapping(address validator => mapping(address delegator => Undelegation)) undelegations;
+    mapping(address validator => mapping(address delegator => Undelegation)) public undelegations;
 
-    /// The time the contract will hold funds after undelegations are requested.
+    /// The time (seconds) the contract will hold funds after undelegations are requested.
     ///
     /// Must allow ample time for node to exit active validator set and slashing
     /// evidence to be submitted.
@@ -218,9 +220,9 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
         address _tokenAddress,
         address _lightClientAddress,
         uint256 _exitEscrowPeriod,
-        address _initialOwner
+        address _timelock
     ) public initializer {
-        __Ownable_init(_initialOwner);
+        __Ownable_init(_timelock);
         __UUPSUpgradeable_init();
         initializeAtBlock();
 
@@ -239,7 +241,7 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
             revert ZeroAddress();
         }
         token = ERC20(_tokenAddress);
-        lightClient = LightClient(_lightClientAddress);
+        lightClient = ILightClient(_lightClientAddress);
         exitEscrowPeriod = _exitEscrowPeriod;
     }
 
@@ -256,7 +258,7 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
         return (1, 0, 0);
     }
 
-    /// @notice only the owner can authorize an upgrade
+    /// @notice only the timelock can authorize an upgrade
     function _authorizeUpgrade(address newImplementation) internal virtual override onlyOwner {
         emit Upgrade(newImplementation);
     }
@@ -269,20 +271,18 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
     }
 
     function ensureValidatorActive(address validator) internal view {
-        if (!(validators[validator].status == ValidatorStatus.Active)) {
+        ValidatorStatus status = validators[validator].status;
+        if (status == ValidatorStatus.Unknown) {
             revert ValidatorInactive();
+        }
+        if (status == ValidatorStatus.Exited) {
+            revert ValidatorAlreadyExited();
         }
     }
 
     function ensureValidatorNotRegistered(address validator) internal view {
         if (validators[validator].status != ValidatorStatus.Unknown) {
             revert ValidatorAlreadyRegistered();
-        }
-    }
-
-    function ensureValidatorNotExited(address validator) internal view {
-        if (validatorExits[validator] != 0) {
-            revert ValidatorAlreadyExited();
         }
     }
 
@@ -333,8 +333,6 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
 
         // Verify that the validator can sign for that blsVK. This prevents rogue public-key
         // attacks.
-        //
-        // TODO: we will move this check to the GCL to save gas.
         bytes memory message = abi.encode(validator);
         BLSSig.verifyBlsSig(message, blsSig, blsVK);
 
@@ -349,12 +347,13 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
     }
 
     /// @notice Deregister a validator
-    function deregisterValidator() external virtual {
+    function deregisterValidator() public virtual {
         address validator = msg.sender;
         ensureValidatorActive(validator);
 
         validators[validator].status = ValidatorStatus.Exited;
         validatorExits[validator] = block.timestamp + exitEscrowPeriod;
+        validators[validator].delegatedAmount = 0;
 
         emit ValidatorExit(validator);
     }
@@ -362,21 +361,23 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
     /// @notice Delegate to a validator
     /// @param validator The validator to delegate to
     /// @param amount The amount to delegate
-    function delegate(address validator, uint256 amount) external virtual {
+    function delegate(address validator, uint256 amount) public virtual {
         ensureValidatorActive(validator);
         address delegator = msg.sender;
 
-        // TODO: revert if amount is zero
+        if (amount == 0) {
+            revert ZeroAmount();
+        }
 
         uint256 allowance = token.allowance(delegator, address(this));
         if (allowance < amount) {
             revert InsufficientAllowance(allowance, amount);
         }
 
+        SafeTransferLib.safeTransferFrom(token, delegator, address(this), amount);
+
         validators[validator].delegatedAmount += amount;
         delegations[validator][delegator] += amount;
-
-        SafeTransferLib.safeTransferFrom(token, delegator, address(this), amount);
 
         emit Delegated(delegator, validator, amount);
     }
@@ -384,14 +385,16 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
     /// @notice Undelegate from a validator
     /// @param validator The validator to undelegate from
     /// @param amount The amount to undelegate
-    function undelegate(address validator, uint256 amount) external virtual {
+    function undelegate(address validator, uint256 amount) public virtual {
         ensureValidatorActive(validator);
         address delegator = msg.sender;
 
-        // TODO: revert if amount is zero
+        if (amount == 0) {
+            revert ZeroAmount();
+        }
 
-        if (validators[delegator].status == ValidatorStatus.Exited) {
-            revert ValidatorAlreadyExited();
+        if (undelegations[validator][delegator].amount != 0) {
+            revert UndelegationAlreadyExists();
         }
 
         uint256 balance = delegations[validator][delegator];
@@ -402,13 +405,14 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
         delegations[validator][delegator] -= amount;
         undelegations[validator][delegator] =
             Undelegation({ amount: amount, unlocksAt: block.timestamp + exitEscrowPeriod });
+        validators[validator].delegatedAmount -= amount;
 
         emit Undelegated(delegator, validator, amount);
     }
 
     /// @notice Withdraw previously delegated funds after an undelegation.
     /// @param validator The validator to withdraw from
-    function claimWithdrawal(address validator) external virtual {
+    function claimWithdrawal(address validator) public virtual {
         address delegator = msg.sender;
         // If entries are missing at any of the levels of the mapping this will return zero
         uint256 amount = undelegations[validator][delegator].amount;
@@ -430,7 +434,7 @@ contract StakeTable is Initializable, InitializedAt, OwnableUpgradeable, UUPSUpg
 
     /// @notice Withdraw previously delegated funds after a validator has exited
     /// @param validator The validator to withdraw from
-    function claimValidatorExit(address validator) external virtual {
+    function claimValidatorExit(address validator) public virtual {
         address delegator = msg.sender;
         uint256 unlocksAt = validatorExits[validator];
         if (unlocksAt == 0) {

@@ -1,10 +1,11 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     ops::RangeInclusive,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{anyhow, Context};
@@ -12,35 +13,41 @@ use async_lock::RwLock;
 use async_trait::async_trait;
 use clap::Parser;
 use espresso_types::{
-    traits::MembershipPersistence,
+    traits::{EventsPersistenceRead, MembershipPersistence},
     v0::traits::{EventConsumer, PersistenceOptions, SequencerPersistence},
-    v0_3::{IndexedStake, Validator},
-    Leaf, Leaf2, NetworkConfig, Payload, SeqTypes,
+    v0_3::{EventKey, IndexedStake, RewardAmount, StakeTableEvent},
+    Leaf, Leaf2, NetworkConfig, Payload, SeqTypes, ValidatorMap,
 };
-use hotshot::{types::BLSPubKey, InitializerEpochInfo};
+use hotshot::InitializerEpochInfo;
+use hotshot_libp2p_networking::network::behaviours::dht::store::persistent::{
+    DhtPersistentStorage, SerializableRecord,
+};
 use hotshot_types::{
     data::{
         vid_disperse::{ADVZDisperseShare, VidDisperseShare2},
-        DaProposal, DaProposal2, EpochNumber, QuorumProposal, QuorumProposal2,
-        QuorumProposalWrapper, VidCommitment, VidDisperseShare,
+        DaProposal, DaProposal2, EpochNumber, QuorumProposal, QuorumProposalWrapper,
+        QuorumProposalWrapperLegacy, VidCommitment, VidDisperseShare,
     },
-    drb::DrbResult,
+    drb::{DrbInput, DrbResult},
     event::{Event, EventType, HotShotAction, LeafInfo},
     message::{convert_proposal, Proposal},
     simple_certificate::{
-        LightClientStateUpdateCertificate, NextEpochQuorumCertificate2, QuorumCertificate,
-        QuorumCertificate2, UpgradeCertificate,
+        LightClientStateUpdateCertificateV1, LightClientStateUpdateCertificateV2,
+        NextEpochQuorumCertificate2, QuorumCertificate, QuorumCertificate2, UpgradeCertificate,
     },
     traits::{
         block_contents::{BlockHeader, BlockPayload},
+        metrics::Metrics,
         node_implementation::{ConsensusTime, NodeType},
     },
     vote::HasViewNumber,
 };
-use indexmap::IndexMap;
 use itertools::Itertools;
 
-use crate::ViewNumber;
+use crate::{
+    persistence::persistence_metrics::PersistenceMetricsValue, ViewNumber,
+    RECENT_STAKE_TABLES_LIMIT,
+};
 
 /// Options for file system backed persistence.
 #[derive(Parser, Clone, Debug)]
@@ -101,8 +108,10 @@ impl PersistenceOptions for Options {
 
         let migration_path = path.join("migration");
         let migrated = if migration_path.is_file() {
-            let bytes = fs::read(&path)
-                .context(format!("unable to read migration from {}", path.display()))?;
+            let bytes = fs::read(&migration_path).context(format!(
+                "unable to read migration from {}",
+                migration_path.display()
+            ))?;
             bincode::deserialize(&bytes).context("malformed migration file")?
         } else {
             HashSet::new()
@@ -114,6 +123,7 @@ impl PersistenceOptions for Options {
                 migrated,
                 view_retention,
             })),
+            metrics: Arc::new(PersistenceMetricsValue::default()),
         })
     }
 
@@ -129,6 +139,8 @@ pub struct Persistence {
     // implementation does not support transaction isolation for concurrent reads and writes. We can
     // improve this in the future by switching to a SQLite-based file system implementation.
     inner: Arc<RwLock<Inner>>,
+    /// A reference to the metrics trait
+    metrics: Arc<PersistenceMetricsValue>,
 }
 
 #[derive(Debug)]
@@ -149,6 +161,10 @@ impl Inner {
 
     fn voted_view_path(&self) -> PathBuf {
         self.path.join("highest_voted_view")
+    }
+
+    fn restart_view_path(&self) -> PathBuf {
+        self.path.join("restart_view")
     }
 
     /// Path to a directory containing decided leaves.
@@ -177,6 +193,10 @@ impl Inner {
         self.path.join("da")
     }
 
+    fn drb_dir_path(&self) -> PathBuf {
+        self.path.join("drb")
+    }
+
     fn da2_dir_path(&self) -> PathBuf {
         self.path.join("da2")
     }
@@ -201,6 +221,9 @@ impl Inner {
         self.path.join("next_epoch_quorum_certificate")
     }
 
+    fn libp2p_dht_path(&self) -> PathBuf {
+        self.path.join("libp2p_dht")
+    }
     fn epoch_drb_result_dir_path(&self) -> PathBuf {
         self.path.join("epoch_drb_result")
     }
@@ -209,7 +232,11 @@ impl Inner {
         self.path.join("epoch_root_block_header")
     }
 
-    fn light_client_state_update_certificate_dir_path(&self) -> PathBuf {
+    fn finalized_state_cert_dir_path(&self) -> PathBuf {
+        self.path.join("finalized_state_cert")
+    }
+
+    fn state_cert_dir_path(&self) -> PathBuf {
         self.path.join("state_cert")
     }
 
@@ -286,6 +313,12 @@ impl Inner {
             None,
             prune_intervals,
         )?;
+        self.prune_files(
+            self.state_cert_dir_path(),
+            prune_view,
+            None,
+            prune_intervals,
+        )?;
 
         // Save the most recent leaf as it will be our anchor point if the node restarts.
         self.prune_files(
@@ -357,6 +390,9 @@ impl Inner {
                 tracing::debug!(?v, "VID share not available at decide");
             }
 
+            // Move the state cert to the finalized dir if it exists.
+            let state_cert = self.finalized_state_cert(v)?;
+
             // Fill in the full block payload using the DA proposals we had persisted.
             if let Some(proposal) = self.load_da_proposal(v)? {
                 let payload = Payload::from_bytes(
@@ -371,6 +407,7 @@ impl Inner {
             let info = LeafInfo {
                 leaf,
                 vid_share,
+                state_cert,
                 // Note: the following fields are not used in Decide event processing, and should be
                 // removed. For now, we just default them.
                 state: Default::default(),
@@ -466,6 +503,7 @@ impl Inner {
     }
 
     fn load_anchor_leaf(&self) -> anyhow::Result<Option<(Leaf2, QuorumCertificate2<SeqTypes>)>> {
+        tracing::info!("Checking `Leaf2` to load the anchor leaf.");
         if self.decided_leaf2_path().is_dir() {
             let mut anchor: Option<(Leaf2, QuorumCertificate2<SeqTypes>)> = None;
 
@@ -488,10 +526,14 @@ impl Inner {
             return Ok(anchor);
         }
 
+        tracing::warn!(
+            "Failed to find an anchor leaf in `Leaf2` storage. Checking legacy `Leaf` storage. \
+             This is very likely to fail."
+        );
         if self.legacy_anchor_leaf_path().is_file() {
             // We may have an old version of storage, where there is just a single file for the
             // anchor leaf. Read it and return the contents.
-            let mut file = File::open(self.legacy_anchor_leaf_path())?;
+            let mut file = BufReader::new(File::open(self.legacy_anchor_leaf_path())?);
 
             // The first 8 bytes just contain the height of the leaf. We can skip this.
             file.seek(SeekFrom::Start(8)).context("seek")?;
@@ -503,6 +545,53 @@ impl Inner {
         }
 
         Ok(None)
+    }
+
+    fn finalized_state_cert(
+        &self,
+        view: ViewNumber,
+    ) -> anyhow::Result<Option<LightClientStateUpdateCertificateV2<SeqTypes>>> {
+        let dir_path = self.state_cert_dir_path();
+        let file_path = dir_path.join(view.u64().to_string()).with_extension("txt");
+
+        if !file_path.exists() {
+            return Ok(None);
+        }
+
+        let bytes = fs::read(&file_path)?;
+
+        let state_cert: LightClientStateUpdateCertificateV2<SeqTypes> =
+            bincode::deserialize(&bytes).or_else(|err_v2| {
+                tracing::info!(
+                    error = %err_v2,
+                    path = %file_path.display(),
+                    "Failed to deserialize state certificate, attempting with v1"
+                );
+
+                bincode::deserialize::<LightClientStateUpdateCertificateV1<SeqTypes>>(&bytes)
+                    .map(Into::into)
+                    .with_context(|| {
+                        format!(
+                            "Failed to deserialize with both v2 and v1 from file '{}'. error: \
+                             {err_v2}",
+                            file_path.display()
+                        )
+                    })
+            })?;
+
+        let epoch = state_cert.epoch.u64();
+        let finalized_dir_path = self.finalized_state_cert_dir_path();
+        fs::create_dir_all(&finalized_dir_path).context("creating finalized state cert dir")?;
+
+        let finalized_file_path = finalized_dir_path
+            .join(epoch.to_string())
+            .with_extension("txt");
+
+        fs::write(&finalized_file_path, &bytes).context(format!(
+            "finalizing light client state update certificate file for epoch {epoch:?}"
+        ))?;
+
+        Ok(Some(state_cert))
     }
 }
 
@@ -541,6 +630,18 @@ impl SequencerPersistence for Persistence {
         let bytes = fs::read(inner.voted_view_path())?
             .try_into()
             .map_err(|bytes| anyhow!("malformed voted view file: {bytes:?}"))?;
+        Ok(Some(ViewNumber::new(u64::from_le_bytes(bytes))))
+    }
+
+    async fn load_restart_view(&self) -> anyhow::Result<Option<ViewNumber>> {
+        let inner = self.inner.read().await;
+        let path = inner.restart_view_path();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path)?
+            .try_into()
+            .map_err(|bytes| anyhow!("malformed restart view file: {bytes:?}"))?;
         Ok(Some(ViewNumber::new(u64::from_le_bytes(bytes))))
     }
 
@@ -640,7 +741,7 @@ impl SequencerPersistence for Persistence {
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.write().await;
         let view_number = proposal.data.view_number().u64();
-        let dir_path = inner.vid_dir_path();
+        let dir_path = inner.vid2_dir_path();
 
         fs::create_dir_all(dir_path.clone()).context("failed to create vid dir")?;
 
@@ -654,8 +755,14 @@ impl SequencerPersistence for Persistence {
                 Ok(false)
             },
             |mut file| {
+                let proposal: Proposal<SeqTypes, VidDisperseShare<SeqTypes>> =
+                    convert_proposal(proposal.clone());
                 let proposal_bytes = bincode::serialize(&proposal).context("serialize proposal")?;
+                let now = Instant::now();
                 file.write_all(&proposal_bytes)?;
+                self.metrics
+                    .internal_append_vid_duration
+                    .add_point(now.elapsed().as_secs_f64());
                 Ok(())
             },
         )
@@ -685,7 +792,11 @@ impl SequencerPersistence for Persistence {
                 let proposal: Proposal<SeqTypes, VidDisperseShare<SeqTypes>> =
                     convert_proposal(proposal.clone());
                 let proposal_bytes = bincode::serialize(&proposal).context("serialize proposal")?;
+                let now = Instant::now();
                 file.write_all(&proposal_bytes)?;
+                self.metrics
+                    .internal_append_vid2_duration
+                    .add_point(now.elapsed().as_secs_f64());
                 Ok(())
             },
         )
@@ -712,7 +823,11 @@ impl SequencerPersistence for Persistence {
             },
             |mut file| {
                 let proposal_bytes = bincode::serialize(&proposal).context("serialize proposal")?;
+                let now = Instant::now();
                 file.write_all(&proposal_bytes)?;
+                self.metrics
+                    .internal_append_da_duration
+                    .add_point(now.elapsed().as_secs_f64());
                 Ok(())
             },
         )
@@ -746,7 +861,31 @@ impl SequencerPersistence for Persistence {
                 file.write_all(&view.u64().to_le_bytes())?;
                 Ok(())
             },
-        )
+        )?;
+
+        if matches!(action, HotShotAction::Vote) {
+            let restart_view_path = &inner.restart_view_path();
+            let restart_view = view + 1;
+            inner.replace(
+                restart_view_path,
+                |mut file| {
+                    let mut bytes = vec![];
+                    file.read_to_end(&mut bytes)?;
+                    let bytes = bytes
+                        .try_into()
+                        .map_err(|bytes| anyhow!("malformed voted view file: {bytes:?}"))?;
+                    let saved_view = ViewNumber::new(u64::from_le_bytes(bytes));
+
+                    // Overwrite the file if the saved view is older than the new view.
+                    Ok(saved_view < restart_view)
+                },
+                |mut file| {
+                    file.write_all(&restart_view.u64().to_le_bytes())?;
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
     }
 
     async fn append_quorum_proposal2(
@@ -768,8 +907,11 @@ impl SequencerPersistence for Persistence {
             },
             |mut file| {
                 let proposal_bytes = bincode::serialize(&proposal).context("serialize proposal")?;
-
+                let now = Instant::now();
                 file.write_all(&proposal_bytes)?;
+                self.metrics
+                    .internal_append_quorum2_duration
+                    .add_point(now.elapsed().as_secs_f64());
                 Ok(())
             },
         )
@@ -790,20 +932,34 @@ impl SequencerPersistence for Persistence {
         let mut map = BTreeMap::new();
         for (view, path) in view_files(&dir_path)? {
             let proposal_bytes = fs::read(path)?;
-            let proposal: Proposal<SeqTypes, QuorumProposal2<SeqTypes>> =
-                match bincode::deserialize(&proposal_bytes) {
-                    Ok(proposal) => proposal,
-                    Err(err) => {
-                        // At this point, if the file contents are invalid, it is most likely an
-                        // error rather than a miscellaneous file somehow ending up in the
-                        // directory. However, we continue on, because it is better to collect as
-                        // many proposals as we can rather than letting one bad proposal cause the
-                        // entire operation to fail, and it is still possible that this was just
-                        // some unintended file whose name happened to match the naming convention.
-                        tracing::warn!(?view, "ignoring malformed quorum proposal file: {err:#}");
-                        continue;
-                    },
-                };
+            let Some(proposal) = bincode::deserialize::<
+                Proposal<SeqTypes, QuorumProposalWrapper<SeqTypes>>,
+            >(&proposal_bytes)
+            .or_else(|error| {
+                bincode::deserialize::<Proposal<SeqTypes, QuorumProposalWrapperLegacy<SeqTypes>>>(
+                    &proposal_bytes,
+                )
+                .map(convert_proposal)
+                .inspect_err(|err_v3| {
+                    // At this point, if the file contents are invalid, it is most likely an
+                    // error rather than a miscellaneous file somehow ending up in the
+                    // directory. However, we continue on, because it is better to collect as
+                    // many proposals as we can rather than letting one bad proposal cause the
+                    // entire operation to fail, and it is still possible that this was just
+                    // some unintended file whose name happened to match the naming convention.
+
+                    tracing::warn!(
+                        ?view,
+                        %error,
+                        error_v3 = %err_v3,
+                        "ignoring malformed quorum proposal file"
+                    );
+                })
+            })
+            .ok() else {
+                continue;
+            };
+
             let proposal2 = convert_proposal(proposal);
 
             // Push to the map and we're done.
@@ -821,8 +977,16 @@ impl SequencerPersistence for Persistence {
         let dir_path = inner.quorum_proposals2_dir_path();
         let file_path = dir_path.join(view.to_string()).with_extension("txt");
         let bytes = fs::read(file_path)?;
-        let proposal = bincode::deserialize(&bytes)?;
-
+        let proposal: Proposal<SeqTypes, QuorumProposalWrapper<SeqTypes>> =
+            bincode::deserialize(&bytes).or_else(|error| {
+                bincode::deserialize::<Proposal<SeqTypes, QuorumProposalWrapperLegacy<SeqTypes>>>(
+                    &bytes,
+                )
+                .map(convert_proposal)
+                .context(format!(
+                    "Failed to deserialize quorum proposal for view {view:?}: {error}."
+                ))
+            })?;
         Ok(proposal)
     }
 
@@ -922,7 +1086,11 @@ impl SequencerPersistence for Persistence {
             },
             |mut file| {
                 let proposal_bytes = bincode::serialize(&proposal).context("serialize proposal")?;
+                let now = Instant::now();
                 file.write_all(&proposal_bytes)?;
+                self.metrics
+                    .internal_append_da2_duration
+                    .add_point(now.elapsed().as_secs_f64());
                 Ok(())
             },
         )
@@ -1194,7 +1362,44 @@ impl SequencerPersistence for Persistence {
         Ok(())
     }
 
-    async fn add_drb_result(
+    async fn store_drb_input(&self, drb_input: DrbInput) -> anyhow::Result<()> {
+        if let Ok(loaded_drb_input) = self.load_drb_input(drb_input.epoch).await {
+            if loaded_drb_input.iteration >= drb_input.iteration {
+                anyhow::bail!(
+                    "DrbInput in storage {:?} is more recent than {:?}, refusing to update",
+                    loaded_drb_input,
+                    drb_input
+                )
+            }
+        }
+
+        let inner = self.inner.write().await;
+        let dir_path = inner.drb_dir_path();
+
+        fs::create_dir_all(dir_path.clone()).context("failed to create drb dir")?;
+
+        let drb_input_bytes =
+            bincode::serialize(&drb_input).context("failed to serialize drb_input")?;
+
+        let file_path = dir_path
+            .join(drb_input.epoch.to_string())
+            .with_extension("bin");
+        fs::write(&file_path, drb_input_bytes).context(format!(
+            "writing epoch drb_input file for epoch {:?} at {:?}",
+            drb_input.epoch, file_path
+        ))
+    }
+
+    async fn load_drb_input(&self, epoch: u64) -> anyhow::Result<DrbInput> {
+        let inner = self.inner.read().await;
+        let path = &inner.drb_dir_path();
+        let file_path = path.join(epoch.to_string()).with_extension("bin");
+        let bytes = fs::read(&file_path).context("read")?;
+        Ok(bincode::deserialize(&bytes)
+            .context(format!("failed to deserialize DrbInput for epoch {epoch}"))?)
+    }
+
+    async fn store_drb_result(
         &self,
         epoch: EpochNumber,
         drb_result: DrbResult,
@@ -1213,7 +1418,7 @@ impl SequencerPersistence for Persistence {
         Ok(())
     }
 
-    async fn add_epoch_root(
+    async fn store_epoch_root(
         &self,
         epoch: EpochNumber,
         block_header: <SeqTypes as NodeType>::BlockHeader,
@@ -1237,11 +1442,12 @@ impl SequencerPersistence for Persistence {
 
     async fn add_state_cert(
         &self,
-        state_cert: LightClientStateUpdateCertificate<SeqTypes>,
+        state_cert: LightClientStateUpdateCertificateV2<SeqTypes>,
     ) -> anyhow::Result<()> {
         let inner = self.inner.write().await;
-        let epoch = state_cert.epoch;
-        let dir_path = inner.light_client_state_update_certificate_dir_path();
+        // let epoch = state_cert.epoch;
+        let view = state_cert.light_client_state.view_number;
+        let dir_path = inner.state_cert_dir_path();
 
         fs::create_dir_all(dir_path.clone())
             .context("failed to create light client state update certificate dir")?;
@@ -1249,9 +1455,9 @@ impl SequencerPersistence for Persistence {
         let bytes = bincode::serialize(&state_cert)
             .context("serialize light client state update certificate")?;
 
-        let file_path = dir_path.join(epoch.to_string()).with_extension("txt");
+        let file_path = dir_path.join(view.to_string()).with_extension("txt");
         fs::write(file_path, bytes).context(format!(
-            "writing light client state update certificate file for epoch {epoch:?}"
+            "writing light client state update certificate file for view {view:?}"
         ))?;
 
         Ok(())
@@ -1300,20 +1506,27 @@ impl SequencerPersistence for Persistence {
 
         result.sort_by(|a, b| a.epoch.cmp(&b.epoch));
 
-        Ok(result)
+        // Keep only the most recent epochs
+        let start = result
+            .len()
+            .saturating_sub(RECENT_STAKE_TABLES_LIMIT as usize);
+        let recent = result[start..].to_vec();
+
+        Ok(recent)
     }
 
     async fn load_state_cert(
         &self,
-    ) -> anyhow::Result<Option<LightClientStateUpdateCertificate<SeqTypes>>> {
+    ) -> anyhow::Result<Option<LightClientStateUpdateCertificateV2<SeqTypes>>> {
         let inner = self.inner.read().await;
-        let dir_path = inner.light_client_state_update_certificate_dir_path();
-
-        let mut result = None;
+        let dir_path = inner.finalized_state_cert_dir_path();
 
         if !dir_path.is_dir() {
-            return Ok(result);
+            return Ok(None);
         }
+
+        let mut result: Option<LightClientStateUpdateCertificateV2<SeqTypes>> = None;
+
         for (epoch, path) in epoch_files(dir_path)? {
             if result.as_ref().is_some_and(|cert| epoch <= cert.epoch) {
                 continue;
@@ -1322,16 +1535,35 @@ impl SequencerPersistence for Persistence {
                 "reading light client state update certificate {}",
                 path.display()
             ))?;
-            result = Some(
-                bincode::deserialize::<LightClientStateUpdateCertificate<SeqTypes>>(&bytes)
-                    .context(format!(
-                        "parsing light client state update certificate {}",
-                        path.display()
-                    ))?,
-            );
+            let cert =
+                bincode::deserialize::<LightClientStateUpdateCertificateV2<SeqTypes>>(&bytes)
+                    .or_else(|error| {
+                        tracing::info!(
+                            %error,
+                            path = %path.display(),
+                            "Failed to deserialize LightClientStateUpdateCertificateV2"
+                        );
+
+                        bincode::deserialize::<LightClientStateUpdateCertificateV1<SeqTypes>>(
+                            &bytes,
+                        )
+                        .map(Into::into)
+                        .with_context(|| {
+                            format!(
+                                "Failed to deserialize with v1 and v2. path='{}'. error: {error}",
+                                path.display()
+                            )
+                        })
+                    })?;
+
+            result = Some(cert);
         }
 
         Ok(result)
+    }
+
+    fn enable_metrics(&mut self, _metrics: &dyn Metrics) {
+        // todo!()
     }
 }
 
@@ -1340,49 +1572,85 @@ impl MembershipPersistence for Persistence {
     async fn load_stake(
         &self,
         epoch: EpochNumber,
-    ) -> anyhow::Result<Option<IndexMap<alloy::primitives::Address, Validator<BLSPubKey>>>> {
+    ) -> anyhow::Result<Option<(ValidatorMap, Option<RewardAmount>)>> {
         let inner = self.inner.read().await;
         let path = &inner.stake_table_dir_path();
         let file_path = path.join(epoch.to_string()).with_extension("txt");
-        let bytes = fs::read(&file_path).context("read")?;
-        Ok(Some(
-            bincode::deserialize(&bytes).context("deserialize combined stake table")?,
-        ))
+
+        if !file_path.exists() {
+            return Ok(None);
+        }
+
+        let bytes = fs::read(&file_path).with_context(|| {
+            format!("failed to read stake table file at {}", file_path.display())
+        })?;
+
+        let stake = match bincode::deserialize(&bytes) {
+            Ok(res) => res,
+            Err(err) => {
+                let map = bincode::deserialize::<ValidatorMap>(&bytes).with_context(|| {
+                    format!(
+                        "fallback deserialization of legacy stake table at {} failed after \
+                         initial error: {}",
+                        file_path.display(),
+                        err
+                    )
+                })?;
+                (map, None)
+            },
+        };
+
+        Ok(Some(stake))
     }
 
     async fn load_latest_stake(&self, limit: u64) -> anyhow::Result<Option<Vec<IndexedStake>>> {
         let limit = limit as usize;
         let inner = self.inner.read().await;
         let path = &inner.stake_table_dir_path();
-        let sorted: Vec<_> = epoch_files(path)?
-            .sorted_unstable_by_key(|t| t.0)
-            .collect::<Vec<_>>();
+        let sorted_files = epoch_files(&path)?
+            .sorted_by(|(e1, _), (e2, _)| e2.cmp(e1))
+            .take(limit);
+        let mut validator_sets: Vec<IndexedStake> = Vec::new();
 
-        let len = sorted.len();
-        let mut slice = &sorted[..];
-        if len > limit {
-            slice = &sorted[len - limit..len - 1]
-        };
-        slice
-            .iter()
-            .map(|(epoch, path)| -> anyhow::Result<Option<IndexedStake>> {
-                let bytes = fs::read(path).context("read")?;
-                let st =
-                    bincode::deserialize(&bytes).context("deserialize combined stake table")?;
-                Ok(Some((*epoch, st)))
-            })
-            .collect()
+        for (epoch, file_path) in sorted_files {
+            let bytes = fs::read(&file_path).with_context(|| {
+                format!("failed to read stake table file at {}", file_path.display())
+            })?;
+
+            let stake: (ValidatorMap, Option<RewardAmount>) =
+                match bincode::deserialize::<(ValidatorMap, Option<RewardAmount>)>(&bytes) {
+                    Ok(res) => res,
+                    Err(err) => {
+                        let validatormap = bincode::deserialize::<ValidatorMap>(&bytes)
+                            .with_context(|| {
+                                format!(
+                                    "failed to deserialize legacy stake table at {}: fallback \
+                                     also failed after initial error: {}",
+                                    file_path.display(),
+                                    err
+                                )
+                            })?;
+
+                        (validatormap, None)
+                    },
+                };
+
+            validator_sets.push((epoch, stake));
+        }
+
+        Ok(Some(validator_sets))
     }
 
     async fn store_stake(
         &self,
         epoch: EpochNumber,
-        stake: IndexMap<alloy::primitives::Address, Validator<BLSPubKey>>,
+        stake: ValidatorMap,
+        block_reward: Option<RewardAmount>,
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.write().await;
         let dir_path = &inner.stake_table_dir_path();
 
-        fs::create_dir_all(dir_path.clone()).context("failed to create proposals dir")?;
+        fs::create_dir_all(dir_path.clone()).context("failed to create stake table dir")?;
 
         let file_path = dir_path.join(epoch.to_string()).with_extension("txt");
 
@@ -1393,15 +1661,251 @@ impl MembershipPersistence for Persistence {
                 Ok(true)
             },
             |mut file| {
-                let bytes =
-                    bincode::serialize(&stake).context("serializing combined stake table")?;
+                let bytes = bincode::serialize(&(stake, block_reward))
+                    .context("serializing combined stake table")?;
                 file.write_all(&bytes)?;
                 Ok(())
             },
         )
     }
+
+    /// store stake table events upto the l1 block
+    async fn store_events(
+        &self,
+        to_l1_block: u64,
+        events: Vec<(EventKey, StakeTableEvent)>,
+    ) -> anyhow::Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut inner = self.inner.write().await;
+        let dir_path = &inner.stake_table_dir_path();
+        let events_dir = dir_path.join("events");
+
+        fs::create_dir_all(events_dir.clone()).context("failed to create events dir")?;
+        // Read the last l1 finalized for which events has been stored
+        let last_l1_finalized_path = events_dir.join("last_l1_finalized").with_extension("bin");
+
+        // check if the last l1 events is higher than the incoming one
+        if last_l1_finalized_path.exists() {
+            let bytes = fs::read(&last_l1_finalized_path).with_context(|| {
+                format!("Failed to read file at path: {last_l1_finalized_path:?}")
+            })?;
+            let mut buf = [0; 8];
+            bytes
+                .as_slice()
+                .read_exact(&mut buf[..8])
+                .with_context(|| {
+                    format!("Failed to read 8 bytes from file at path: {last_l1_finalized_path:?}")
+                })?;
+            let persisted_l1_block = u64::from_le_bytes(buf);
+            if persisted_l1_block > to_l1_block {
+                tracing::debug!(?persisted_l1_block, ?to_l1_block, "stored l1 is greater");
+                return Ok(());
+            }
+        }
+
+        // stores each event in a separate file
+        // this can cause performance issue when, for example, reading all the files
+        // However, the plan is to remove file system completely in future
+        for (event_key, event) in events {
+            let (block_number, event_index) = event_key;
+            // file name is like block_index.json
+            let filename = format!("{block_number}_{event_index}");
+            let file_path = events_dir.join(filename).with_extension("json");
+
+            if file_path.exists() {
+                continue;
+            }
+
+            let file = File::create(&file_path).context("Failed to create event file")?;
+            let writer = BufWriter::new(file);
+
+            serde_json::to_writer_pretty(writer, &event)
+                .context("Failed to write event to file")?;
+        }
+
+        // update the l1 block for which we have processed events
+        inner.replace(
+            &last_l1_finalized_path,
+            |_| Ok(true),
+            |mut file| {
+                let bytes = to_l1_block.to_le_bytes();
+
+                file.write_all(&bytes)?;
+                tracing::debug!("updated l1 finalized ={to_l1_block:?}");
+                Ok(())
+            },
+        )
+    }
+
+    /// Loads all events from persistent storage up to the specified L1 block.
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple containing:
+    /// - `Option<u64>` - The queried L1 block for which all events have been successfully fetched.
+    /// - `Vec<(EventKey, StakeTableEvent)>` - A list of events, where each entry is a tuple of the event key
+    /// event key is (l1 block number, log index)
+    ///   and the corresponding StakeTable event.
+    ///
+    async fn load_events(
+        &self,
+        to_l1_block: u64,
+    ) -> anyhow::Result<(
+        Option<EventsPersistenceRead>,
+        Vec<(EventKey, StakeTableEvent)>,
+    )> {
+        let inner = self.inner.read().await;
+        let dir_path = inner.stake_table_dir_path();
+        let events_dir = dir_path.join("events");
+
+        // check if we have any events in storage
+        // we can do this by checking last l1 finalized block for which we processed events
+        let last_l1_finalized_path = events_dir.join("last_l1_finalized").with_extension("bin");
+
+        if !last_l1_finalized_path.exists() || !events_dir.exists() {
+            return Ok((None, Vec::new()));
+        }
+
+        let mut events = Vec::new();
+
+        let bytes = fs::read(&last_l1_finalized_path)
+            .with_context(|| format!("Failed to read file at path: {last_l1_finalized_path:?}"))?;
+        let mut buf = [0; 8];
+        bytes
+            .as_slice()
+            .read_exact(&mut buf[..8])
+            .with_context(|| {
+                format!("Failed to read 8 bytes from file at path: {last_l1_finalized_path:?}")
+            })?;
+
+        let last_processed_l1_block = u64::from_le_bytes(buf);
+
+        // Determine the L1 block for querying events.
+        // If the last stored L1 block is greater than the requested block, limit the query to the requested block.
+        // Otherwise, query up to the last stored block.
+        let query_l1_block = if last_processed_l1_block > to_l1_block {
+            to_l1_block
+        } else {
+            last_processed_l1_block
+        };
+
+        for entry in fs::read_dir(&events_dir).context("events directory")? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+
+            if path
+                .extension()
+                .context(format!("extension for path={path:?}"))?
+                != "json"
+            {
+                continue;
+            }
+
+            let filename = path
+                .file_stem()
+                .and_then(|f| f.to_str())
+                .unwrap_or_default();
+
+            let parts: Vec<&str> = filename.split('_').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+
+            let block_number = parts[0].parse::<u64>()?;
+            let log_index = parts[1].parse::<u64>()?;
+
+            if block_number > query_l1_block {
+                continue;
+            }
+
+            let file =
+                File::open(&path).context(format!("Failed to open event file. path={path:?}"))?;
+            let reader = BufReader::new(file);
+
+            let event: StakeTableEvent = serde_json::from_reader(reader)
+                .context(format!("Failed to deserialize event at path={path:?}"))?;
+
+            events.push(((block_number, log_index), event));
+        }
+
+        events.sort_by_key(|(key, _)| *key);
+
+        if query_l1_block == to_l1_block {
+            Ok((Some(EventsPersistenceRead::Complete), events))
+        } else {
+            Ok((
+                Some(EventsPersistenceRead::UntilL1Block(query_l1_block)),
+                events,
+            ))
+        }
+    }
 }
 
+#[async_trait]
+impl DhtPersistentStorage for Persistence {
+    /// Save the DHT to the file on disk
+    ///
+    /// # Errors
+    /// - If we fail to serialize the records
+    /// - If we fail to write the serialized records to the file
+    async fn save(&self, records: Vec<SerializableRecord>) -> anyhow::Result<()> {
+        // Bincode-serialize the records
+        let to_save =
+            bincode::serialize(&records).with_context(|| "failed to serialize records")?;
+
+        // Get the path to save the file to
+        let path = self.inner.read().await.libp2p_dht_path();
+
+        // Create the directory if it doesn't exist
+        fs::create_dir_all(path.parent().with_context(|| "directory had no parent")?)
+            .with_context(|| "failed to create directory")?;
+
+        // Get a write lock on the inner struct
+        let mut inner = self.inner.write().await;
+
+        // Save the file, replacing the previous one if it exists
+        inner
+            .replace(
+                &path,
+                |_| {
+                    // Always overwrite the previous file
+                    Ok(true)
+                },
+                |mut file| {
+                    file.write_all(&to_save)
+                        .with_context(|| "failed to write records to file")?;
+                    Ok(())
+                },
+            )
+            .with_context(|| "failed to save records to file")?;
+
+        Ok(())
+    }
+
+    /// Load the DHT from the file on disk
+    ///
+    /// # Errors
+    /// - If we fail to read the file
+    /// - If we fail to deserialize the records
+    async fn load(&self) -> anyhow::Result<Vec<SerializableRecord>> {
+        // Read the contents of the file
+        let contents = std::fs::read(self.inner.read().await.libp2p_dht_path())
+            .with_context(|| "Failed to read records from file")?;
+
+        // Deserialize the contents
+        let records: Vec<SerializableRecord> =
+            bincode::deserialize(&contents).with_context(|| "Failed to deserialize records")?;
+
+        Ok(records)
+    }
+}
 /// Update a `NetworkConfig` that may have originally been persisted with an old version.
 fn migrate_network_config(
     mut network_config: serde_json::Value,
@@ -1459,6 +1963,15 @@ fn migrate_network_config(
         config.insert("epoch_height".into(), 0.into());
     }
 
+    // HotShotConfig was upgraded to include `drb_difficulty` and `drb_upgrade_difficulty` parameters. Initialize with a default
+    // if missing.
+    if !config.contains_key("drb_difficulty") {
+        config.insert("drb_difficulty".into(), 0.into());
+    }
+    if !config.contains_key("drb_upgrade_difficulty") {
+        config.insert("drb_upgrade_difficulty".into(), 0.into());
+    }
+
     Ok(network_config)
 }
 
@@ -1514,10 +2027,32 @@ fn epoch_files(
 }
 
 #[cfg(test)]
-mod testing {
-    use tempfile::TempDir;
+mod test {
+    use std::marker::PhantomData;
 
-    use super::{super::testing::TestablePersistence, *};
+    use committable::{Commitment, CommitmentBoundsArkless, Committable};
+    use espresso_types::{Header, Leaf, NodeState, PubKey, ValidatedState};
+    use hotshot::types::SignatureKey;
+    use hotshot_example_types::node_types::TestVersions;
+    use hotshot_query_service::testing::mocks::MockVersions;
+    use hotshot_types::{
+        data::QuorumProposal2,
+        light_client::LightClientState,
+        simple_certificate::QuorumCertificate,
+        simple_vote::QuorumData,
+        traits::{
+            block_contents::GENESIS_VID_NUM_STORAGE_NODES, node_implementation::Versions,
+            EncodeBytes,
+        },
+        vid::advz::advz_scheme,
+    };
+    use jf_vid::VidScheme;
+    use serde_json::json;
+    use tempfile::TempDir;
+    use vbs::version::StaticVersionType;
+
+    use super::*;
+    use crate::{persistence::tests::TestablePersistence, BLSPubKey};
 
     #[async_trait]
     impl TestablePersistence for Persistence {
@@ -1531,41 +2066,6 @@ mod testing {
             Options::new(storage.path().into())
         }
     }
-}
-
-#[cfg(test)]
-mod generic_tests {
-    use super::{super::persistence_tests, Persistence};
-    // For some reason this is the only way to import the macro defined in another module of this
-    // crate.
-    use crate::*;
-
-    instantiate_persistence_tests!(Persistence);
-}
-
-#[cfg(test)]
-mod test {
-    use std::marker::PhantomData;
-
-    use committable::{Commitment, CommitmentBoundsArkless, Committable};
-    use espresso_types::{Header, Leaf, NodeState, PubKey, ValidatedState};
-    use hotshot::types::SignatureKey;
-    use hotshot_example_types::node_types::TestVersions;
-    use hotshot_query_service::testing::mocks::MockVersions;
-    use hotshot_types::{
-        data::{vid_commitment, QuorumProposal2},
-        simple_certificate::QuorumCertificate,
-        simple_vote::QuorumData,
-        traits::{node_implementation::Versions, EncodeBytes},
-        vid::advz::advz_scheme,
-    };
-    use jf_vid::VidScheme;
-    use sequencer_utils::test_utils::setup_test;
-    use serde_json::json;
-    use vbs::version::StaticVersionType;
-
-    use super::*;
-    use crate::{persistence::testing::TestablePersistence, BLSPubKey};
 
     #[test]
     fn test_config_migrations_add_builder_urls() {
@@ -1593,7 +2093,9 @@ mod test {
                 "stop_proposing_time": 2,
                 "start_voting_time": 1,
                 "stop_voting_time": 2,
-                "epoch_height": 0
+                "epoch_height": 0,
+                "drb_difficulty": 0,
+                "drb_upgrade_difficulty": 0,
             }
         });
 
@@ -1613,7 +2115,9 @@ mod test {
                 "stop_proposing_time": 2,
                 "start_voting_time": 1,
                 "stop_voting_time": 2,
-                "epoch_height": 0
+                "epoch_height": 0,
+                "drb_difficulty": 0,
+                "drb_upgrade_difficulty": 0,
             }
         });
 
@@ -1638,7 +2142,9 @@ mod test {
                 "stop_proposing_time": 0,
                 "start_voting_time": 9007199254740991u64,
                 "stop_voting_time": 0,
-                "epoch_height": 0
+                "epoch_height": 0,
+                "drb_difficulty": 0,
+                "drb_upgrade_difficulty": 0,
             }
         });
 
@@ -1658,16 +2164,17 @@ mod test {
                 "stop_proposing_time": 2,
                 "start_voting_time": 1,
                 "stop_voting_time": 2,
-                "epoch_height": 0
+                "epoch_height": 0,
+                "drb_difficulty": 0,
+                "drb_upgrade_difficulty": 0,
             }
         });
 
         assert_eq!(migrate_network_config(before.clone()).unwrap(), before);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     pub async fn test_consensus_migration() {
-        setup_test();
         let rows = 300;
         let tmp = Persistence::tmp_storage().await;
         let mut opt = Persistence::options(&tmp);
@@ -1681,7 +2188,7 @@ mod test {
         let qp_dir_path = inner.quorum_proposals_dir_path();
         fs::create_dir_all(qp_dir_path.clone()).expect("failed to create proposals dir");
 
-        let state_cert_dir_path = inner.light_client_state_update_certificate_dir_path();
+        let state_cert_dir_path = inner.state_cert_dir_path();
         fs::create_dir_all(state_cert_dir_path.clone()).expect("failed to create state cert dir");
         drop(inner);
 
@@ -1697,27 +2204,22 @@ mod test {
                 Payload::from_transactions([], &validated_state, &instance_state)
                     .await
                     .unwrap();
-            let builder_commitment = payload.builder_commitment(&metadata);
+
             let payload_bytes = payload.encode();
 
-            let payload_commitment = vid_commitment::<TestVersions>(
-                &payload_bytes,
-                &metadata.encode(),
-                4,
-                <TestVersions as Versions>::Base::VERSION,
-            );
+            let block_header =
+                Header::genesis::<TestVersions>(&instance_state, payload.clone(), &metadata);
 
-            let block_header = Header::genesis(
-                &instance_state,
-                payload_commitment,
-                builder_commitment,
-                metadata,
-            );
-
-            let state_cert = LightClientStateUpdateCertificate::<SeqTypes> {
+            let state_cert = LightClientStateUpdateCertificateV2::<SeqTypes> {
                 epoch: EpochNumber::new(i),
-                light_client_state: Default::default(), // filling arbitrary value
-                signatures: vec![],                     // filling arbitrary value
+                light_client_state: LightClientState {
+                    view_number: i,
+                    block_height: i,
+                    block_comm_root: Default::default(),
+                },
+                next_stake_table_state: Default::default(),
+                signatures: vec![], // filling arbitrary value
+                auth_root: Default::default(),
             };
             assert!(storage.add_state_cert(state_cert).await.is_ok());
 
@@ -1754,7 +2256,7 @@ mod test {
             let mut leaf = Leaf::from_quorum_proposal(&quorum_proposal);
             leaf.fill_block_payload::<TestVersions>(
                 payload,
-                4,
+                GENESIS_VID_NUM_STORAGE_NODES,
                 <TestVersions as Versions>::Base::VERSION,
             )
             .unwrap();
@@ -1799,7 +2301,9 @@ mod test {
                 .unwrap();
 
             drop(inner);
-            let disperse = advz_scheme(4).disperse(payload_bytes.clone()).unwrap();
+            let disperse = advz_scheme(GENESIS_VID_NUM_STORAGE_NODES)
+                .disperse(payload_bytes.clone())
+                .unwrap();
 
             let vid = ADVZDisperseShare::<SeqTypes> {
                 view_number: ViewNumber::new(i),
@@ -1881,8 +2385,7 @@ mod test {
             "quorum proposals count does not match",
         );
 
-        let state_certs =
-            fs::read_dir(inner.light_client_state_update_certificate_dir_path()).unwrap();
+        let state_certs = fs::read_dir(inner.state_cert_dir_path()).unwrap();
         let state_cert_count = state_certs
             .filter_map(Result::ok)
             .filter(|e| e.path().is_file())
@@ -1892,21 +2395,26 @@ mod test {
             "light client state update certificate count does not match",
         );
 
+        // Reinitialize the file system persistence using the same path.
+        // re run the consensus migration.
+        // No changes will occur, as the migration has already been completed.
+        let storage = opt.create().await.unwrap();
+        storage.migrate_consensus().await.unwrap();
+
+        let inner = storage.inner.read().await;
+        let decided_leaves = fs::read_dir(inner.decided_leaf2_path()).unwrap();
+        let decided_leaves_count = decided_leaves
+            .filter_map(Result::ok)
+            .filter(|e| e.path().is_file())
+            .count();
         assert_eq!(
-            storage.load_state_cert().await.unwrap().unwrap(),
-            LightClientStateUpdateCertificate::<SeqTypes> {
-                epoch: EpochNumber::new(rows - 1),
-                light_client_state: Default::default(),
-                signatures: vec![]
-            },
-            "Wrong light client state update certificate in the storage",
-        )
+            decided_leaves_count, rows as usize,
+            "decided leaves count does not match",
+        );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_load_quorum_proposals_invalid_extension() {
-        setup_test();
-
         let tmp = Persistence::tmp_storage().await;
         let storage = Persistence::connect(&tmp).await;
 
@@ -1929,6 +2437,7 @@ mod test {
                     view_change_evidence: None,
                     next_drb_result: None,
                     next_epoch_justify_qc: None,
+                    state_cert: None,
                 },
             },
             signature,
@@ -1965,10 +2474,8 @@ mod test {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_load_quorum_proposals_malformed_data() {
-        setup_test();
-
         let tmp = Persistence::tmp_storage().await;
         let storage = Persistence::connect(&tmp).await;
 
@@ -1993,6 +2500,7 @@ mod test {
                     view_change_evidence: None,
                     next_drb_result: None,
                     next_epoch_justify_qc: None,
+                    state_cert: None,
                 },
             },
             signature,
@@ -2020,40 +2528,5 @@ mod test {
                 .into_iter()
                 .collect::<BTreeMap<_, _>>()
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_membership_persistence() -> anyhow::Result<()> {
-        setup_test();
-
-        let tmp = Persistence::tmp_storage().await;
-        let mut opt = Persistence::options(&tmp);
-
-        let storage = opt.create().await.unwrap();
-
-        let validator = Validator::mock();
-        let mut st = IndexMap::new();
-        st.insert(validator.account, validator);
-        storage
-            .store_stake(EpochNumber::new(10), st.clone())
-            .await?;
-
-        let table = storage.load_stake(EpochNumber::new(10)).await?.unwrap();
-        assert_eq!(st, table);
-
-        let val2 = Validator::mock();
-        let mut st2 = IndexMap::new();
-        st2.insert(val2.account, val2);
-        storage
-            .store_stake(EpochNumber::new(11), st2.clone())
-            .await?;
-
-        let tables = storage.load_latest_stake(4).await?.unwrap();
-        let mut iter = tables.iter();
-        assert_eq!(Some(&(EpochNumber::new(10), st)), iter.next());
-        assert_eq!(Some(&(EpochNumber::new(11), st2)), iter.next());
-        assert_eq!(None, iter.next());
-
-        Ok(())
     }
 }

@@ -16,20 +16,18 @@
 //! consensus network with two nodes and connects a query service to each node. It runs each query
 //! server on local host. The program continues until it is manually killed.
 
-use std::{num::NonZeroUsize, str::FromStr, sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
+use alloy::primitives::U256;
 use async_lock::RwLock;
 use clap::Parser;
 use futures::future::{join_all, try_join_all};
 use hotshot::{
     traits::implementations::{MasterMap, MemoryNetwork},
     types::{SignatureKey, SystemContextHandle},
-    HotShotInitializer, MarketplaceConfig, SystemContext,
+    HotShotInitializer, SystemContext,
 };
-use hotshot_example_types::{
-    auction_results_provider_types::TestAuctionResultsProvider, state_types::TestInstanceState,
-    storage_types::TestStorage,
-};
+use hotshot_example_types::{state_types::TestInstanceState, storage_types::TestStorage};
 use hotshot_query_service::{
     data_source,
     fetching::provider::NoFetching,
@@ -47,10 +45,10 @@ use hotshot_types::{
     epoch_membership::EpochMembershipCoordinator,
     light_client::StateKeyPair,
     signature_key::BLSPubKey,
+    storage_metrics::StorageMetricsValue,
     traits::{election::Membership, network::Topic},
     HotShotConfig, PeerConfig,
 };
-use primitive_types::U256;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 use vbs::version::StaticVersionType;
@@ -221,6 +219,9 @@ async fn init_consensus(
         stop_voting_time: 0,
         epoch_height: 0,
         epoch_start_block: 0,
+        stake_table_capacity: hotshot_types::light_client::DEFAULT_STAKE_TABLE_CAPACITY,
+        drb_difficulty: 0,
+        drb_upgrade_difficulty: 0,
     };
 
     let nodes = join_all(priv_keys.into_iter().zip(data_sources).enumerate().map(
@@ -246,6 +247,7 @@ async fn init_consensus(
                 let coordinator = EpochMembershipCoordinator::new(
                     Arc::new(RwLock::new(membership)),
                     config.epoch_height,
+                    &storage.clone(),
                 );
 
                 SystemContext::init(
@@ -266,10 +268,7 @@ async fn init_consensus(
                     .unwrap(),
                     ConsensusMetricsValue::new(&*data_source.populate_metrics()),
                     storage,
-                    MarketplaceConfig {
-                        auction_results_provider: Arc::new(TestAuctionResultsProvider::default()),
-                        fallback_builder_url: Url::from_str("https://some.url").unwrap(),
-                    },
+                    StorageMetricsValue::new(&*data_source.populate_metrics()),
                 )
                 .await
                 .unwrap()

@@ -171,7 +171,7 @@ impl AvidMScheme {
             payload
                 .iter()
                 .chain(iter::once(&1u8))
-                .chain(iter::repeat(&0u8).take(pad_num_zeros)),
+                .chain(iter::repeat_n(&0u8, pad_num_zeros)),
         )
         .collect()
     }
@@ -242,7 +242,7 @@ impl AvidMScheme {
                 "Weight distribution is inconsistent with the given param".to_string(),
             ));
         }
-        if distribution.iter().any(|&w| w == 0) {
+        if distribution.contains(&0u32) {
             return Err(VidError::Argument("Weight cannot be zero".to_string()));
         }
 
@@ -490,10 +490,10 @@ pub mod tests {
 
             for payload_byte_len in payload_byte_lens {
                 println!(
-                    "recovery_threshold:: {} num_storage_nodes: {} payload_byte_len: {}",
-                    recovery_threshold, num_storage_nodes, payload_byte_len
+                    "recovery_threshold:: {recovery_threshold} num_storage_nodes: \
+                     {num_storage_nodes} payload_byte_len: {payload_byte_len}"
                 );
-                println!("weights: {:?}", weights);
+                println!("weights: {weights:?}");
 
                 let payload = {
                     let mut bytes_random = vec![0u8; payload_byte_len];

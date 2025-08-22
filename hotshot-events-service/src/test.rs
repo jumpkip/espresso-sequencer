@@ -2,6 +2,7 @@
 mod tests {
     use std::sync::Arc;
 
+    use alloy::primitives::U256;
     use async_lock::RwLock;
     use futures::stream::StreamExt;
     use hotshot_example_types::node_types::TestTypes;
@@ -16,7 +17,6 @@ mod tests {
         },
         PeerConfig,
     };
-    use primitive_types::U256;
     use surf_disco::Client;
     use tide_disco::{App, Url};
     use tokio::spawn;
@@ -54,11 +54,12 @@ mod tests {
         // Start the web server.
         let mut app = App::<_, Error>::with_state(events_streamer.clone());
 
-        let hotshot_events_api =
-            define_api::<Arc<RwLock<EventsStreamer<TestTypes>>>, TestTypes, StaticVersion<0, 1>>(
-                &Options::default(),
-            )
-            .expect("Failed to define hotshot eventsAPI");
+        let hotshot_events_api = define_api::<
+            Arc<RwLock<EventsStreamer<TestTypes>>>,
+            TestTypes,
+            StaticVersion<0, 1>,
+        >(&Options::default(), "0.0.1".parse().unwrap())
+        .expect("Failed to define hotshot eventsAPI");
 
         app.register_module("hotshot_events", hotshot_events_api)
             .expect("Failed to register hotshot events API");
@@ -113,11 +114,12 @@ mod tests {
         // Start the web server.
         let mut app = App::<_, Error>::with_state(events_streamer.clone());
 
-        let hotshot_events_api =
-            define_api::<Arc<RwLock<EventsStreamer<TestTypes>>>, TestTypes, StaticVersion<0, 1>>(
-                &Options::default(),
-            )
-            .expect("Failed to define hotshot eventsAPI");
+        let hotshot_events_api = define_api::<
+            Arc<RwLock<EventsStreamer<TestTypes>>>,
+            TestTypes,
+            StaticVersion<0, 1>,
+        >(&Options::default(), "0.0.1".parse().unwrap())
+        .expect("Failed to define hotshot eventsAPI");
 
         app.register_module("api", hotshot_events_api)
             .expect("Failed to register hotshot events API");
@@ -125,7 +127,7 @@ mod tests {
         spawn(app.serve(api_url.clone(), StaticVersion::<0, 1>::instance()));
 
         let client = Client::<Error, StaticVersion<0, 1>>::new(
-            format!("http://localhost:{}/api", port).parse().unwrap(),
+            format!("http://localhost:{port}/api").parse().unwrap(),
         );
         client.connect(None).await;
 
@@ -157,11 +159,12 @@ mod tests {
         // Start the web server.
         let mut app = App::<_, Error>::with_state(events_streamer.clone());
 
-        let hotshot_events_api =
-            define_api::<Arc<RwLock<EventsStreamer<TestTypes>>>, TestTypes, StaticVersion<0, 1>>(
-                &Options::default(),
-            )
-            .expect("Failed to define hotshot eventsAPI");
+        let hotshot_events_api = define_api::<
+            Arc<RwLock<EventsStreamer<TestTypes>>>,
+            TestTypes,
+            StaticVersion<0, 1>,
+        >(&Options::default(), "1.0.0".parse().unwrap())
+        .expect("Failed to define hotshot eventsAPI");
 
         app.register_module("hotshot_events", hotshot_events_api)
             .expect("Failed to register hotshot events API");
@@ -170,7 +173,7 @@ mod tests {
 
         // Start Client 1
         let client_1 = Client::<Error, StaticVersion<0, 1>>::new(
-            format!("http://localhost:{}/hotshot_events", port)
+            format!("http://localhost:{port}/hotshot_events")
                 .parse()
                 .unwrap(),
         );
@@ -189,7 +192,7 @@ mod tests {
 
         // Start Client 2
         let client_2 = Client::<Error, StaticVersion<0, 1>>::new(
-            format!("http://localhost:{}/hotshot_events", port)
+            format!("http://localhost:{port}/hotshot_events")
                 .parse()
                 .unwrap(),
         );
@@ -212,7 +215,7 @@ mod tests {
             let mut receive_count = 0;
             while let Some(event) = events_1.next().await {
                 let event = event.unwrap();
-                tracing::info!("Received event in Client 1: {:?}", event);
+                tracing::info!("Received event in Client 1: {event:?}");
 
                 receive_count += 1;
 
@@ -233,7 +236,7 @@ mod tests {
             while let Some(event) = events_2.next().await {
                 let event = event.unwrap();
 
-                tracing::info!("Received event in Client 2: {:?}", event);
+                tracing::info!("Received event in Client 2: {event:?}");
                 receive_count += 1;
 
                 if receive_count == total_count {
@@ -259,7 +262,7 @@ mod tests {
                     .await;
                 send_count += 1;
                 tracing::debug!("After writing to events_source");
-                tracing::info!("Event sent: {:?}", tx_event);
+                tracing::info!("Event sent: {tx_event:?}");
                 if send_count >= total_count {
                     break;
                 }

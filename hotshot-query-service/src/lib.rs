@@ -260,7 +260,7 @@
 //! # use hotshot_query_service::{Header, QueryResult, VidShare};
 //! # use hotshot_query_service::availability::{
 //! #   AvailabilityDataSource, BlockId, BlockQueryData, Fetch, FetchStream, LeafId, LeafQueryData,
-//! #   PayloadMetadata, PayloadQueryData, TransactionHash, TransactionQueryData,
+//! #   PayloadMetadata, PayloadQueryData, TransactionFromBlock, TransactionHash,
 //! #   VidCommonMetadata, VidCommonQueryData,
 //! # };
 //! # use hotshot_query_service::metrics::PrometheusMetrics;
@@ -306,7 +306,7 @@
 //! #   async fn get_vid_common_metadata<ID>(&self, id: ID) -> Fetch<VidCommonMetadata<AppTypes>>
 //! #   where
 //! #       ID: Into<BlockId<AppTypes>> + Send + Sync { todo!() }
-//! #   async fn get_transaction(&self, hash: TransactionHash<AppTypes>) -> Fetch<TransactionQueryData<AppTypes>> { todo!() }
+//! #   async fn get_transaction<T: TransactionFromBlock<AppTypes>>(&self, hash: TransactionHash<AppTypes>) -> Fetch<T> { todo!() }
 //! #   async fn get_leaf_range<R>(&self, range: R) -> FetchStream<LeafQueryData<AppTypes>>
 //! #   where
 //! #       R: RangeBounds<usize> + Send { todo!() }
@@ -555,8 +555,10 @@ where
         "1.0.0".parse().unwrap(),
     )
     .map_err(Error::internal)?;
-    let node_api = node::define_api(&options.node, bind_version).map_err(Error::internal)?;
-    let status_api = status::define_api(&options.status, bind_version).map_err(Error::internal)?;
+    let node_api = node::define_api(&options.node, bind_version, "0.0.1".parse().unwrap())
+        .map_err(Error::internal)?;
+    let status_api = status::define_api(&options.status, bind_version, "0.0.1".parse().unwrap())
+        .map_err(Error::internal)?;
 
     // Create app.
     let data_source = Arc::new(data_source);
@@ -612,9 +614,10 @@ mod test {
     use super::*;
     use crate::{
         availability::{
-            AvailabilityDataSource, BlockId, BlockInfo, BlockQueryData, Fetch, FetchStream, LeafId,
-            LeafQueryData, PayloadMetadata, PayloadQueryData, TransactionHash,
-            TransactionQueryData, UpdateAvailabilityData, VidCommonMetadata, VidCommonQueryData,
+            AvailabilityDataSource, BlockId, BlockInfo, BlockQueryData, BlockWithTransaction,
+            Fetch, FetchStream, LeafId, LeafQueryData, NamespaceId, PayloadMetadata,
+            PayloadQueryData, StateCertQueryDataV2, TransactionHash, UpdateAvailabilityData,
+            VidCommonMetadata, VidCommonQueryData,
         },
         metrics::PrometheusMetrics,
         node::{NodeDataSource, SyncStatus, TimeWindowQueryData, WindowStart},
@@ -774,11 +777,14 @@ mod test {
                 .get_vid_common_metadata_range_rev(start, end)
                 .await
         }
-        async fn get_transaction(
+        async fn get_block_containing_transaction(
             &self,
             hash: TransactionHash<MockTypes>,
-        ) -> Fetch<TransactionQueryData<MockTypes>> {
-            self.hotshot_qs.get_transaction(hash).await
+        ) -> Fetch<BlockWithTransaction<MockTypes>> {
+            self.hotshot_qs.get_block_containing_transaction(hash).await
+        }
+        async fn get_state_cert(&self, epoch: u64) -> Fetch<StateCertQueryDataV2<MockTypes>> {
+            self.hotshot_qs.get_state_cert(epoch).await
         }
     }
 
@@ -791,14 +797,20 @@ mod test {
         async fn count_transactions_in_range(
             &self,
             range: impl RangeBounds<usize> + Send,
+            namespace: Option<NamespaceId<MockTypes>>,
         ) -> QueryResult<usize> {
-            self.hotshot_qs.count_transactions_in_range(range).await
+            self.hotshot_qs
+                .count_transactions_in_range(range, namespace)
+                .await
         }
         async fn payload_size_in_range(
             &self,
             range: impl RangeBounds<usize> + Send,
+            namespace: Option<NamespaceId<MockTypes>>,
         ) -> QueryResult<usize> {
-            self.hotshot_qs.payload_size_in_range(range).await
+            self.hotshot_qs
+                .payload_size_in_range(range, namespace)
+                .await
         }
         async fn vid_share<ID>(&self, id: ID) -> QueryResult<VidShare>
         where
@@ -852,7 +864,7 @@ mod test {
         let leaf = LeafQueryData::new(leaf, qc).unwrap();
         let block = BlockQueryData::new(leaf.header().clone(), MockPayload::genesis());
         hotshot_qs
-            .append(BlockInfo::new(leaf, Some(block), None, None))
+            .append(BlockInfo::new(leaf, Some(block), None, None, None))
             .await
             .unwrap();
 
@@ -881,19 +893,29 @@ mod test {
             availability::define_api(
                 &Default::default(),
                 MockBase::instance(),
-                "1.0.0".parse().unwrap(),
+                "0.0.1".parse().unwrap(),
             )
             .unwrap(),
         )
         .unwrap()
         .register_module(
             "node",
-            node::define_api(&Default::default(), MockBase::instance()).unwrap(),
+            node::define_api(
+                &Default::default(),
+                MockBase::instance(),
+                "0.0.1".parse().unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap()
         .register_module(
             "status",
-            status::define_api(&Default::default(), MockBase::instance()).unwrap(),
+            status::define_api(
+                &Default::default(),
+                MockBase::instance(),
+                "0.0.1".parse().unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap()
         .module::<Error, MockBase>("mod", module_spec)
@@ -926,11 +948,11 @@ mod test {
         let port = pick_unused_port().unwrap();
         let _server = BackgroundTask::spawn(
             "server",
-            app.serve(format!("0.0.0.0:{}", port), MockBase::instance()),
+            app.serve(format!("0.0.0.0:{port}"), MockBase::instance()),
         );
 
         let client =
-            Client::<Error, MockBase>::new(format!("http://localhost:{}", port).parse().unwrap());
+            Client::<Error, MockBase>::new(format!("http://localhost:{port}").parse().unwrap());
         assert!(client.connect(Some(Duration::from_secs(60))).await);
 
         client.post::<()>("mod/ext/42").send().await.unwrap();

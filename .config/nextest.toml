@@ -15,9 +15,22 @@ test(test_process_client_handling_stream_subscribe_voters)
 slow-timeout = { period = "2s", terminate-after = 1 }
 retries  = 10
 
+[[profile.default.overrides]]
+filter = 'test(test_hotshot_event_streaming_epoch_progression)'
+slow-timeout = { period = "8m", terminate-after = 4 }
+
+[[profile.default.overrides]]
+filter = 'test(test_pos_upgrade_view_based)'
+slow-timeout = { period = "2m", terminate-after = 5 }
+
 # The restart tests run an entire sequencing network, and so are quite resource intensive.
 [[profile.default.overrides]]
 filter = 'test(slow_test_restart)'
+slow-timeout = { period = "1m", terminate-after = 3 }
+threads-required = 'num-cpus'
+
+[[profile.default.overrides]]
+filter = 'package(request-response)'
 threads-required = 'num-cpus'
 
 # HotShot integration tests
@@ -44,7 +57,7 @@ default-filter = 'package(tests)'
 retries = 2
 
 # Serial required
-# TRY 3 FAIL [   2.790s] hotshot-testing::tests_4 tests_4::test_marketplace::test_marketplace_builders_down::testtypes_::memoryimpl_::test_marketplace_builders_down
+# TRY 3 FAIL [   2.790s] hotshot-testing::tests_4 tests_4::test_marketplace::test_builders_down::testtypes_::memoryimpl_::test_builders_down
 # TRY 3 FAIL [   4.446s] hotshot-testing::tests_4 tests_4::test_marketplace::test_marketplace_fallback_builder_down::testtypes_::memoryimpl_::test_marketplace_fallback_builder_down
 # TRY 3 FAIL [   5.119s] hotshot-testing::tests_4 tests_4::test_marketplace::test_marketplace_upgrade::testtypes_::memoryimpl_::test_marketplace_upgrade
 #

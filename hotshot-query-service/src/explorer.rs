@@ -152,7 +152,7 @@ impl<Types: NodeType> From<query_data::TransactionDetailResponse<Types>>
 pub struct TransactionSummariesResponse<Types: NodeType>
 where
     Header<Types>: ExplorerHeader<Types>,
-    Transaction<Types>: ExplorerTransaction,
+    Transaction<Types>: ExplorerTransaction<Types>,
 {
     pub transaction_summaries: Vec<TransactionSummary<Types>>,
 }
@@ -160,7 +160,7 @@ where
 impl<Types: NodeType> From<Vec<TransactionSummary<Types>>> for TransactionSummariesResponse<Types>
 where
     Header<Types>: ExplorerHeader<Types>,
-    Transaction<Types>: ExplorerTransaction,
+    Transaction<Types>: ExplorerTransaction<Types>,
 {
     fn from(transaction_summaries: Vec<TransactionSummary<Types>>) -> Self {
         Self {
@@ -176,7 +176,7 @@ where
 pub struct ExplorerSummaryResponse<Types: NodeType>
 where
     Header<Types>: ExplorerHeader<Types>,
-    Transaction<Types>: ExplorerTransaction,
+    Transaction<Types>: ExplorerTransaction<Types>,
 {
     pub explorer_summary: ExplorerSummary<Types>,
 }
@@ -184,7 +184,7 @@ where
 impl<Types: NodeType> From<ExplorerSummary<Types>> for ExplorerSummaryResponse<Types>
 where
     Header<Types>: ExplorerHeader<Types>,
-    Transaction<Types>: ExplorerTransaction,
+    Transaction<Types>: ExplorerTransaction<Types>,
 {
     fn from(explorer_summary: ExplorerSummary<Types>) -> Self {
         Self { explorer_summary }
@@ -198,7 +198,7 @@ where
 pub struct SearchResultResponse<Types: NodeType>
 where
     Header<Types>: ExplorerHeader<Types>,
-    Transaction<Types>: ExplorerTransaction,
+    Transaction<Types>: ExplorerTransaction<Types>,
 {
     pub search_results: SearchResult<Types>,
 }
@@ -206,7 +206,7 @@ where
 impl<Types: NodeType> From<SearchResult<Types>> for SearchResultResponse<Types>
 where
     Header<Types>: ExplorerHeader<Types>,
-    Transaction<Types>: ExplorerTransaction,
+    Transaction<Types>: ExplorerTransaction<Types>,
 {
     fn from(search_results: SearchResult<Types>) -> Self {
         Self { search_results }
@@ -238,11 +238,12 @@ fn validate_limit(
 /// defined in the `explorer.toml` file.
 pub fn define_api<State, Types: NodeType, Ver: StaticVersionType + 'static>(
     _: Ver,
+    api_ver: semver::Version,
 ) -> Result<Api<State, Error, Ver>, ApiError>
 where
     State: 'static + Send + Sync + ReadState,
     Header<Types>: ExplorerHeader<Types> + QueryableHeader<Types>,
-    Transaction<Types>: ExplorerTransaction,
+    Transaction<Types>: ExplorerTransaction<Types>,
     Payload<Types>: QueryablePayload<Types>,
     <State as ReadState>::State: ExplorerDataSource<Types> + Send + Sync,
 {
@@ -252,7 +253,7 @@ where
         None,
     )?;
 
-    api.with_version("0.0.1".parse().unwrap())
+    api.with_version(api_ver)
         .get("get_block_detail", move |req, state| {
             async move {
                 let target = match (
@@ -328,10 +329,10 @@ where
 
                 let filter = match (
                     req.opt_integer_param("block"),
-                    req.opt_integer_param("namespace"),
+                    req.opt_integer_param::<_, i64>("namespace"),
                 ) {
                     (Ok(Some(block)), _) => TransactionSummaryFilter::Block(block),
-                    (_, Ok(Some(namespace))) => TransactionSummaryFilter::RollUp(namespace),
+                    (_, Ok(Some(namespace))) => TransactionSummaryFilter::RollUp(namespace.into()),
                     _ => TransactionSummaryFilter::None,
                 };
 
@@ -407,7 +408,6 @@ mod test {
         testing::{
             consensus::{MockNetwork, MockSqlDataSource},
             mocks::{mock_transaction, MockBase, MockTypes, MockVersions},
-            setup_test,
         },
         ApiState, Error,
     };
@@ -487,7 +487,7 @@ mod test {
             let target_num = min(num_blocks as usize, 10);
             // Retrieve the 20 latest block summaries
             let block_summaries_response: BlockSummaryResponse<MockTypes> = client
-                .get(format!("blocks/latest/{}", target_num).as_str())
+                .get(format!("blocks/latest/{target_num}").as_str())
                 .send()
                 .await
                 .unwrap();
@@ -848,7 +848,7 @@ mod test {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_api() {
         test_api_helper().await;
     }
@@ -862,8 +862,6 @@ mod test {
     }
 
     async fn test_api_helper() {
-        setup_test();
-
         // Create the consensus network.
         let mut network = MockNetwork::<MockSqlDataSource, MockVersions>::init().await;
         network.start().await;
@@ -871,8 +869,11 @@ mod test {
         // Start the web server.
         let port = pick_unused_port().unwrap();
         let mut app = App::<_, Error>::with_state(ApiState::from(network.data_source()));
-        app.register_module("explorer", define_api(MockBase::instance()).unwrap())
-            .unwrap();
+        app.register_module(
+            "explorer",
+            define_api(MockBase::instance(), "0.0.1".parse().unwrap()).unwrap(),
+        )
+        .unwrap();
         app.register_module(
             "availability",
             availability::define_api(
@@ -889,19 +890,17 @@ mod test {
 
         network.spawn(
             "server",
-            app.serve(format!("0.0.0.0:{}", port), MockBase::instance()),
+            app.serve(format!("0.0.0.0:{port}"), MockBase::instance()),
         );
 
         // Start a client.
         let availability_client = Client::<Error, MockBase>::new(
-            format!("http://localhost:{}/availability", port)
+            format!("http://localhost:{port}/availability")
                 .parse()
                 .unwrap(),
         );
         let explorer_client = Client::<Error, MockBase>::new(
-            format!("http://localhost:{}/explorer", port)
-                .parse()
-                .unwrap(),
+            format!("http://localhost:{port}/explorer").parse().unwrap(),
         );
 
         assert!(

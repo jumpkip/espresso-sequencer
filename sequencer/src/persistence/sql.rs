@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -8,20 +14,24 @@ use derivative::Derivative;
 use derive_more::derive::{From, Into};
 use espresso_types::{
     parse_duration, parse_size,
-    traits::MembershipPersistence,
+    traits::{EventsPersistenceRead, MembershipPersistence},
     v0::traits::{EventConsumer, PersistenceOptions, SequencerPersistence, StateCatchup},
-    v0_3::{IndexedStake, Validator},
+    v0_3::{EventKey, IndexedStake, RewardAmount, StakeTableEvent},
     BackoffParams, BlockMerkleTree, FeeMerkleTree, Leaf, Leaf2, NetworkConfig, Payload,
+    ValidatorMap,
 };
 use futures::stream::StreamExt;
-use hotshot::{types::BLSPubKey, InitializerEpochInfo};
+use hotshot::InitializerEpochInfo;
+use hotshot_libp2p_networking::network::behaviours::dht::store::persistent::{
+    DhtPersistentStorage, SerializableRecord,
+};
 use hotshot_query_service::{
     availability::LeafQueryData,
     data_source::{
         storage::{
             pruning::PrunerCfg,
             sql::{
-                include_migrations, query_as, syntax_helpers::MAX_FN, Config, Db, SqlStorage,
+                include_migrations, query_as, syntax_helpers::MAX_FN, Config, Db, Read, SqlStorage,
                 Transaction, TransactionMode, Write,
             },
         },
@@ -37,27 +47,30 @@ use hotshot_query_service::{
 use hotshot_types::{
     data::{
         vid_disperse::{ADVZDisperseShare, VidDisperseShare2},
-        DaProposal, DaProposal2, EpochNumber, QuorumProposal, QuorumProposalWrapper, VidCommitment,
-        VidDisperseShare,
+        DaProposal, DaProposal2, EpochNumber, QuorumProposal, QuorumProposalWrapper,
+        QuorumProposalWrapperLegacy, VidCommitment, VidDisperseShare,
     },
-    drb::DrbResult,
+    drb::{DrbInput, DrbResult},
     event::{Event, EventType, HotShotAction, LeafInfo},
     message::{convert_proposal, Proposal},
     simple_certificate::{
-        LightClientStateUpdateCertificate, NextEpochQuorumCertificate2, QuorumCertificate,
-        QuorumCertificate2, UpgradeCertificate,
+        LightClientStateUpdateCertificateV1, LightClientStateUpdateCertificateV2,
+        NextEpochQuorumCertificate2, QuorumCertificate, QuorumCertificate2, UpgradeCertificate,
     },
     traits::{
         block_contents::{BlockHeader, BlockPayload},
+        metrics::Metrics,
         node_implementation::ConsensusTime,
     },
     vote::HasViewNumber,
 };
-use indexmap::IndexMap;
 use itertools::Itertools;
 use sqlx::{query, Executor, Row};
 
-use crate::{catchup::SqlStateCatchup, NodeType, SeqTypes, ViewNumber};
+use crate::{
+    catchup::SqlStateCatchup, persistence::persistence_metrics::PersistenceMetricsValue, NodeType,
+    SeqTypes, ViewNumber, RECENT_STAKE_TABLES_LIMIT,
+};
 
 /// Options for Postgres-backed persistence.
 #[derive(Parser, Clone, Derivative)]
@@ -115,7 +128,7 @@ pub fn build_sqlite_path(path: &str) -> anyhow::Result<PathBuf> {
     // if `sqlite` sub dir does not exist then create it
     if !sub_dir.exists() {
         std::fs::create_dir_all(&sub_dir)
-            .with_context(|| format!("failed to create directory: {:?}", sub_dir))?;
+            .with_context(|| format!("failed to create directory: {sub_dir:?}"))?;
     }
 
     Ok(sub_dir.join("database"))
@@ -238,6 +251,13 @@ pub struct Options {
         default_value = "25"
     )]
     pub(crate) max_connections: u32,
+
+    /// Sets the batch size for the types migration.
+    /// Determines how many `(leaf, vid)` rows are selected from the old types table
+    /// and migrated at once.
+    /// Default is `10000`` if not set
+    #[clap(long, env = "ESPRESSO_SEQUENCER_DATABASE_TYPES_MIGRATION_BATCH_SIZE")]
+    pub(crate) types_migration_batch_size: Option<u64>,
 
     // Keep the database connection pool when persistence is created,
     // allowing it to be reused across multiple instances instead of creating
@@ -459,6 +479,12 @@ pub struct PruningOptions {
         value_parser = parse_duration,
     )]
     interval: Option<Duration>,
+
+    /// Number of SQLite pages to vacuum from the freelist
+    /// during each pruner cycle.
+    /// This value corresponds to `N` in the SQLite PRAGMA `incremental_vacuum(N)`,
+    #[clap(long, env = "ESPRESSO_SEQUENCER_PRUNER_INCREMENTAL_VACUUM_PAGES")]
+    pages: Option<u64>,
 }
 
 impl From<PruningOptions> for PrunerCfg {
@@ -481,6 +507,10 @@ impl From<PruningOptions> for PrunerCfg {
         }
         if let Some(interval) = opt.interval {
             cfg = cfg.with_interval(interval);
+        }
+
+        if let Some(pages) = opt.pages {
+            cfg = cfg.with_incremental_vacuum_pages(pages)
         }
 
         cfg = cfg.with_state_tables(vec![
@@ -563,6 +593,7 @@ impl PersistenceOptions for Options {
         let persistence = Persistence {
             db: SqlStorage::connect(config).await?,
             gc_opt: self.consensus_pruning,
+            internal_metrics: PersistenceMetricsValue::default(),
         };
         persistence.migrate_quorum_proposal_leaf_hashes().await?;
         self.pool = Some(persistence.db.pool());
@@ -580,6 +611,8 @@ impl PersistenceOptions for Options {
 pub struct Persistence {
     db: SqlStorage,
     gc_opt: ConsensusPruningOptions,
+    /// A reference to the internal metrics
+    internal_metrics: PersistenceMetricsValue,
 }
 
 impl Persistence {
@@ -735,6 +768,16 @@ impl Persistence {
                 })
                 .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
 
+            // Collect state certs for the decide event.
+            let state_certs = Self::load_state_certs(&mut tx, from_view, to_view)
+                .await
+                .inspect_err(|err| {
+                    tracing::error!(
+                        ?from_view,
+                        ?to_view,
+                        "failed to load state certificates. error={err:#}"
+                    );
+                })?;
             drop(tx);
 
             // Collate all the information by view number and construct a chain of leaves.
@@ -764,9 +807,14 @@ impl Persistence {
                         tracing::debug!(?view, "DA proposal not available at decide");
                     }
 
+                    let state_cert = state_certs
+                        .get(&view)
+                        .cloned();
+
                     LeafInfo {
                         leaf,
                         vid_share,
+                        state_cert,
                         // Note: the following fields are not used in Decide event processing, and
                         // should be removed. For now, we just default them.
                         state: Default::default(),
@@ -803,6 +851,18 @@ impl Persistence {
             )
             .await?;
 
+            // Store all the finalized state certs
+            for (epoch, state_cert) in state_certs {
+                let state_cert_bytes = bincode::serialize(&state_cert)?;
+                tx.upsert(
+                    "finalized_state_cert",
+                    ["epoch", "state_cert"],
+                    ["epoch"],
+                    [(epoch as i64, state_cert_bytes)],
+                )
+                .await?;
+            }
+
             // Delete the data that has been fully processed.
             tx.execute(
                 query("DELETE FROM vid_share2 where view >= $1 AND view <= $2")
@@ -828,6 +888,12 @@ impl Persistence {
                     .bind(to_view.u64() as i64),
             )
             .await?;
+            tx.execute(
+                query("DELETE FROM state_cert where view >= $1 AND view <= $2")
+                    .bind(from_view.u64() as i64)
+                    .bind(to_view.u64() as i64),
+            )
+            .await?;
 
             // Clean up leaves, but do not delete the most recent one (all leaves with a view number
             // less than the given value). This is necessary to ensure that, in case of a restart,
@@ -842,6 +908,40 @@ impl Persistence {
             tx.commit().await?;
             last_processed_view = Some(to_view.u64() as i64);
         }
+    }
+
+    async fn load_state_certs(
+        tx: &mut Transaction<Read>,
+        from_view: ViewNumber,
+        to_view: ViewNumber,
+    ) -> anyhow::Result<BTreeMap<u64, LightClientStateUpdateCertificateV2<SeqTypes>>> {
+        let rows = tx
+            .fetch_all(
+                query("SELECT view, state_cert FROM state_cert WHERE view >= $1 AND view <= $2")
+                    .bind(from_view.u64() as i64)
+                    .bind(to_view.u64() as i64),
+            )
+            .await?;
+
+        let mut result = BTreeMap::new();
+
+        for row in rows {
+            let data: Vec<u8> = row.get("state_cert");
+
+            let cert: LightClientStateUpdateCertificateV2<SeqTypes> = bincode::deserialize(&data)
+                .or_else(|err_v2| {
+                bincode::deserialize::<LightClientStateUpdateCertificateV1<SeqTypes>>(&data)
+                    .map(Into::into)
+                    .context(format!(
+                        "Failed to deserialize LightClientStateUpdateCertificate: with v1 and v2. \
+                         error: {err_v2}"
+                    ))
+            })?;
+
+            result.insert(cert.epoch.u64(), cert);
+        }
+
+        Ok(result)
     }
 
     #[tracing::instrument(skip(self))]
@@ -1027,6 +1127,19 @@ impl SequencerPersistence for Persistence {
             }))
     }
 
+    async fn load_restart_view(&self) -> anyhow::Result<Option<ViewNumber>> {
+        Ok(self
+            .db
+            .read()
+            .await?
+            .fetch_optional(query("SELECT view FROM restart_view WHERE id = 0"))
+            .await?
+            .map(|row| {
+                let view: i64 = row.get("view");
+                ViewNumber::new(view as u64)
+            }))
+    }
+
     async fn load_anchor_leaf(
         &self,
     ) -> anyhow::Result<Option<(Leaf2, QuorumCertificate2<SeqTypes>)>> {
@@ -1116,7 +1229,21 @@ impl SequencerPersistence for Persistence {
                     let view: i64 = row.get("view");
                     let view_number: ViewNumber = ViewNumber::new(view.try_into()?);
                     let bytes: Vec<u8> = row.get("data");
-                    let proposal = bincode::deserialize(&bytes)?;
+                    let proposal: Proposal<SeqTypes, QuorumProposalWrapper<SeqTypes>> =
+                        bincode::deserialize(&bytes).or_else(|error| {
+                            bincode::deserialize::<
+                                Proposal<SeqTypes, QuorumProposalWrapperLegacy<SeqTypes>>,
+                            >(&bytes)
+                            .map(convert_proposal)
+                            .inspect_err(|err_v3| {
+                                tracing::warn!(
+                                    ?view_number,
+                                    %error,
+                                    %err_v3,
+                                    "ignoring malformed quorum proposal DB row"
+                                );
+                            })
+                        })?;
                     Ok((view_number, proposal))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?,
@@ -1133,7 +1260,16 @@ impl SequencerPersistence for Persistence {
                 .bind(view.u64() as i64)
                 .fetch_one(tx.as_mut())
                 .await?;
-        let proposal = bincode::deserialize(&data)?;
+        let proposal: Proposal<SeqTypes, QuorumProposalWrapper<SeqTypes>> =
+            bincode::deserialize(&data).or_else(|error| {
+                bincode::deserialize::<Proposal<SeqTypes, QuorumProposalWrapperLegacy<SeqTypes>>>(
+                    &data,
+                )
+                .map(convert_proposal)
+                .context(format!(
+                    "Failed to deserialize quorum proposal for view {view}. error={error}"
+                ))
+            })?;
 
         Ok(proposal)
     }
@@ -1144,19 +1280,25 @@ impl SequencerPersistence for Persistence {
     ) -> anyhow::Result<()> {
         let view = proposal.data.view_number.u64();
         let payload_hash = proposal.data.payload_commitment;
-        let data_bytes = bincode::serialize(proposal).unwrap();
+        let proposal: Proposal<SeqTypes, VidDisperseShare<SeqTypes>> =
+            convert_proposal(proposal.clone());
+        let data_bytes = bincode::serialize(&proposal).unwrap();
 
+        let now = Instant::now();
         let mut tx = self.db.write().await?;
         tx.upsert(
-            "vid_share",
+            "vid_share2",
             ["view", "data", "payload_hash"],
             ["view"],
             [(view as i64, data_bytes, payload_hash.to_string())],
         )
         .await?;
-        tx.commit().await
+        let res = tx.commit().await;
+        self.internal_metrics
+            .internal_append_vid_duration
+            .add_point(now.elapsed().as_secs_f64());
+        res
     }
-
     async fn append_vid2(
         &self,
         proposal: &Proposal<SeqTypes, VidDisperseShare2<SeqTypes>>,
@@ -1167,6 +1309,7 @@ impl SequencerPersistence for Persistence {
             convert_proposal(proposal.clone());
         let data_bytes = bincode::serialize(&proposal).unwrap();
 
+        let now = Instant::now();
         let mut tx = self.db.write().await?;
         tx.upsert(
             "vid_share2",
@@ -1175,7 +1318,11 @@ impl SequencerPersistence for Persistence {
             [(view as i64, data_bytes, payload_hash.to_string())],
         )
         .await?;
-        tx.commit().await
+        let res = tx.commit().await;
+        self.internal_metrics
+            .internal_append_vid2_duration
+            .add_point(now.elapsed().as_secs_f64());
+        res
     }
 
     async fn append_da(
@@ -1187,6 +1334,7 @@ impl SequencerPersistence for Persistence {
         let view = data.view_number().u64();
         let data_bytes = bincode::serialize(proposal).unwrap();
 
+        let now = Instant::now();
         let mut tx = self.db.write().await?;
         tx.upsert(
             "da_proposal",
@@ -1195,7 +1343,11 @@ impl SequencerPersistence for Persistence {
             [(view as i64, data_bytes, vid_commit.to_string())],
         )
         .await?;
-        tx.commit().await
+        let res = tx.commit().await;
+        self.internal_metrics
+            .internal_append_da_duration
+            .add_point(now.elapsed().as_secs_f64());
+        res
     }
 
     async fn record_action(
@@ -1216,6 +1368,17 @@ impl SequencerPersistence for Persistence {
 
         let mut tx = self.db.write().await?;
         tx.execute(query(&stmt).bind(view.u64() as i64)).await?;
+
+        if matches!(action, HotShotAction::Vote) {
+            let restart_view = view + 1;
+            let stmt = format!(
+                "INSERT INTO restart_view (id, view) VALUES (0, $1)
+                ON CONFLICT (id) DO UPDATE SET view = {MAX_FN}(restart_view.view, excluded.view)"
+            );
+            tx.execute(query(&stmt).bind(restart_view.u64() as i64))
+                .await?;
+        }
+
         tx.commit().await
     }
 
@@ -1227,6 +1390,8 @@ impl SequencerPersistence for Persistence {
 
         let proposal_bytes = bincode::serialize(&proposal).context("serializing proposal")?;
         let leaf_hash = Committable::commit(&Leaf2::from_quorum_proposal(&proposal.data));
+
+        let now = Instant::now();
         let mut tx = self.db.write().await?;
         tx.upsert(
             "quorum_proposals2",
@@ -1250,8 +1415,11 @@ impl SequencerPersistence for Persistence {
             )],
         )
         .await?;
-
-        tx.commit().await
+        let res = tx.commit().await;
+        self.internal_metrics
+            .internal_append_quorum2_duration
+            .add_point(now.elapsed().as_secs_f64());
+        res
     }
 
     async fn load_upgrade_certificate(
@@ -1295,11 +1463,14 @@ impl SequencerPersistence for Persistence {
 
     async fn migrate_anchor_leaf(&self) -> anyhow::Result<()> {
         let batch_size: i64 = 10000;
-        let mut offset: i64 = 0;
         let mut tx = self.db.read().await?;
 
-        let (is_completed,) = query_as::<(bool,)>(
-            "SELECT completed from epoch_migration WHERE table_name = 'anchor_leaf'",
+        // The SQL migration populates the table name and sets a default value of 0 for migrated rows.
+        // so, fetch_one() would always return a row
+        // The number of migrated rows is updated after each batch insert.
+        // This allows the types migration to resume from where it left off.
+        let (is_completed, mut offset) = query_as::<(bool, i64)>(
+            "SELECT completed, migrated_rows from epoch_migration WHERE table_name = 'anchor_leaf'",
         )
         .fetch_one(tx.as_mut())
         .await?;
@@ -1312,12 +1483,13 @@ impl SequencerPersistence for Persistence {
         tracing::warn!("migrating decided leaves..");
         loop {
             let mut tx = self.db.read().await?;
-            let rows =
-                query("SELECT view, leaf, qc FROM anchor_leaf ORDER BY view LIMIT $1 OFFSET $2")
-                    .bind(batch_size)
-                    .bind(offset)
-                    .fetch_all(tx.as_mut())
-                    .await?;
+            let rows = query(
+                "SELECT view, leaf, qc FROM anchor_leaf WHERE view >= $1 ORDER BY view LIMIT $2",
+            )
+            .bind(offset)
+            .bind(batch_size)
+            .fetch_all(tx.as_mut())
+            .await?;
 
             drop(tx);
             if rows.is_empty() {
@@ -1344,17 +1516,35 @@ impl SequencerPersistence for Persistence {
             let mut query_builder: sqlx::QueryBuilder<Db> =
                 sqlx::QueryBuilder::new("INSERT INTO anchor_leaf2 (view, leaf, qc) ");
 
+            offset = values.last().context("last row")?.0;
+
             query_builder.push_values(values.into_iter(), |mut b, (view, leaf, qc)| {
                 b.push_bind(view).push_bind(leaf).push_bind(qc);
             });
+
+            // Offset tracking prevents duplicate inserts
+            // Added as a safeguard.
+            query_builder.push(" ON CONFLICT DO NOTHING");
 
             let query = query_builder.build();
 
             let mut tx = self.db.write().await?;
             query.execute(tx.as_mut()).await?;
+
+            tx.upsert(
+                "epoch_migration",
+                ["table_name", "completed", "migrated_rows"],
+                ["table_name"],
+                [("anchor_leaf".to_string(), false, offset)],
+            )
+            .await?;
             tx.commit().await?;
-            offset += batch_size;
-            tracing::info!("anchor leaf migration progress: {} rows", offset);
+
+            tracing::info!(
+                "anchor leaf migration progress: rows={} offset={}",
+                rows.len(),
+                offset
+            );
 
             if rows.len() < batch_size as usize {
                 break;
@@ -1366,9 +1556,9 @@ impl SequencerPersistence for Persistence {
         let mut tx = self.db.write().await?;
         tx.upsert(
             "epoch_migration",
-            ["table_name", "completed"],
+            ["table_name", "completed", "migrated_rows"],
             ["table_name"],
-            [("anchor_leaf".to_string(), true)],
+            [("anchor_leaf".to_string(), true, offset)],
         )
         .await?;
         tx.commit().await?;
@@ -1380,11 +1570,10 @@ impl SequencerPersistence for Persistence {
 
     async fn migrate_da_proposals(&self) -> anyhow::Result<()> {
         let batch_size: i64 = 10000;
-        let mut offset: i64 = 0;
         let mut tx = self.db.read().await?;
 
-        let (is_completed,) = query_as::<(bool,)>(
-            "SELECT completed from epoch_migration WHERE table_name = 'da_proposal'",
+        let (is_completed, mut offset) = query_as::<(bool, i64)>(
+            "SELECT completed, migrated_rows from epoch_migration WHERE table_name = 'da_proposal'",
         )
         .fetch_one(tx.as_mut())
         .await?;
@@ -1399,10 +1588,11 @@ impl SequencerPersistence for Persistence {
         loop {
             let mut tx = self.db.read().await?;
             let rows = query(
-                "SELECT payload_hash, data FROM da_proposal ORDER BY view LIMIT $1 OFFSET $2",
+                "SELECT payload_hash, data FROM da_proposal WHERE view >= $1 ORDER BY view LIMIT \
+                 $2",
             )
-            .bind(batch_size)
             .bind(offset)
+            .bind(batch_size)
             .fetch_all(tx.as_mut())
             .await?;
 
@@ -1416,10 +1606,12 @@ impl SequencerPersistence for Persistence {
                 let data: Vec<u8> = row.try_get("data")?;
                 let payload_hash: String = row.try_get("payload_hash")?;
 
-                let da_proposal: DaProposal<SeqTypes> = bincode::deserialize(&data)?;
-                let da_proposal2: DaProposal2<SeqTypes> = da_proposal.into();
+                let da_proposal: Proposal<SeqTypes, DaProposal<SeqTypes>> =
+                    bincode::deserialize(&data)?;
+                let da_proposal2: Proposal<SeqTypes, DaProposal2<SeqTypes>> =
+                    convert_proposal(da_proposal);
 
-                let view = da_proposal2.view_number.u64() as i64;
+                let view = da_proposal2.data.view_number.u64() as i64;
                 let data = bincode::serialize(&da_proposal2)?;
 
                 values.push((view, payload_hash, data));
@@ -1428,20 +1620,30 @@ impl SequencerPersistence for Persistence {
             let mut query_builder: sqlx::QueryBuilder<Db> =
                 sqlx::QueryBuilder::new("INSERT INTO da_proposal2 (view, payload_hash, data) ");
 
+            offset = values.last().context("last row")?.0;
             query_builder.push_values(values.into_iter(), |mut b, (view, payload_hash, data)| {
                 b.push_bind(view).push_bind(payload_hash).push_bind(data);
             });
-
+            query_builder.push(" ON CONFLICT DO NOTHING");
             let query = query_builder.build();
 
             let mut tx = self.db.write().await?;
             query.execute(tx.as_mut()).await?;
 
+            tx.upsert(
+                "epoch_migration",
+                ["table_name", "completed", "migrated_rows"],
+                ["table_name"],
+                [("da_proposal".to_string(), false, offset)],
+            )
+            .await?;
             tx.commit().await?;
 
-            tracing::info!("DA proposals migration progress: {} rows", offset);
-            offset += batch_size;
-
+            tracing::info!(
+                "DA proposals migration progress: rows={} offset={}",
+                rows.len(),
+                offset
+            );
             if rows.len() < batch_size as usize {
                 break;
             }
@@ -1452,9 +1654,9 @@ impl SequencerPersistence for Persistence {
         let mut tx = self.db.write().await?;
         tx.upsert(
             "epoch_migration",
-            ["table_name", "completed"],
+            ["table_name", "completed", "migrated_rows"],
             ["table_name"],
-            [("da_proposal".to_string(), true)],
+            [("da_proposal".to_string(), true, offset)],
         )
         .await?;
         tx.commit().await?;
@@ -1466,11 +1668,11 @@ impl SequencerPersistence for Persistence {
 
     async fn migrate_vid_shares(&self) -> anyhow::Result<()> {
         let batch_size: i64 = 10000;
-        let mut offset: i64 = 0;
+
         let mut tx = self.db.read().await?;
 
-        let (is_completed,) = query_as::<(bool,)>(
-            "SELECT completed from epoch_migration WHERE table_name = 'vid_share'",
+        let (is_completed, mut offset) = query_as::<(bool, i64)>(
+            "SELECT completed, migrated_rows from epoch_migration WHERE table_name = 'vid_share'",
         )
         .fetch_one(tx.as_mut())
         .await?;
@@ -1483,12 +1685,13 @@ impl SequencerPersistence for Persistence {
         tracing::warn!("migrating vid shares..");
         loop {
             let mut tx = self.db.read().await?;
-            let rows =
-                query("SELECT payload_hash, data FROM vid_share ORDER BY view LIMIT $1 OFFSET $2")
-                    .bind(batch_size)
-                    .bind(offset)
-                    .fetch_all(tx.as_mut())
-                    .await?;
+            let rows = query(
+                "SELECT payload_hash, data FROM vid_share WHERE view >= $1 ORDER BY view LIMIT $2",
+            )
+            .bind(offset)
+            .bind(batch_size)
+            .fetch_all(tx.as_mut())
+            .await?;
 
             drop(tx);
             if rows.is_empty() {
@@ -1500,10 +1703,12 @@ impl SequencerPersistence for Persistence {
                 let data: Vec<u8> = row.try_get("data")?;
                 let payload_hash: String = row.try_get("payload_hash")?;
 
-                let vid_share: ADVZDisperseShare<SeqTypes> = bincode::deserialize(&data)?;
-                let vid_share2: VidDisperseShare<SeqTypes> = vid_share.into();
+                let vid_share: Proposal<SeqTypes, ADVZDisperseShare<SeqTypes>> =
+                    bincode::deserialize(&data)?;
+                let vid_share2: Proposal<SeqTypes, VidDisperseShare<SeqTypes>> =
+                    convert_proposal(vid_share);
 
-                let view = vid_share2.view_number().u64() as i64;
+                let view = vid_share2.data.view_number().u64() as i64;
                 let data = bincode::serialize(&vid_share2)?;
 
                 values.push((view, payload_hash, data));
@@ -1511,6 +1716,8 @@ impl SequencerPersistence for Persistence {
 
             let mut query_builder: sqlx::QueryBuilder<Db> =
                 sqlx::QueryBuilder::new("INSERT INTO vid_share2 (view, payload_hash, data) ");
+
+            offset = values.last().context("last row")?.0;
 
             query_builder.push_values(values.into_iter(), |mut b, (view, payload_hash, data)| {
                 b.push_bind(view).push_bind(payload_hash).push_bind(data);
@@ -1520,10 +1727,21 @@ impl SequencerPersistence for Persistence {
 
             let mut tx = self.db.write().await?;
             query.execute(tx.as_mut()).await?;
-            tx.commit().await?;
-            tracing::info!("VID shares migration progress: {} rows", offset);
-            offset += batch_size;
 
+            tx.upsert(
+                "epoch_migration",
+                ["table_name", "completed", "migrated_rows"],
+                ["table_name"],
+                [("vid_share".to_string(), false, offset)],
+            )
+            .await?;
+            tx.commit().await?;
+
+            tracing::info!(
+                "VID shares migration progress: rows={} offset={}",
+                rows.len(),
+                offset
+            );
             if rows.len() < batch_size as usize {
                 break;
             }
@@ -1534,9 +1752,9 @@ impl SequencerPersistence for Persistence {
         let mut tx = self.db.write().await?;
         tx.upsert(
             "epoch_migration",
-            ["table_name", "completed"],
+            ["table_name", "completed", "migrated_rows"],
             ["table_name"],
-            [("vid_share".to_string(), true)],
+            [("vid_share".to_string(), true, offset)],
         )
         .await?;
         tx.commit().await?;
@@ -1548,11 +1766,11 @@ impl SequencerPersistence for Persistence {
 
     async fn migrate_quorum_proposals(&self) -> anyhow::Result<()> {
         let batch_size: i64 = 10000;
-        let mut offset: i64 = 0;
         let mut tx = self.db.read().await?;
 
-        let (is_completed,) = query_as::<(bool,)>(
-            "SELECT completed from epoch_migration WHERE table_name = 'quorum_proposals'",
+        let (is_completed, mut offset) = query_as::<(bool, i64)>(
+            "SELECT completed, migrated_rows from epoch_migration WHERE table_name = \
+             'quorum_proposals'",
         )
         .fetch_one(tx.as_mut())
         .await?;
@@ -1566,12 +1784,14 @@ impl SequencerPersistence for Persistence {
 
         loop {
             let mut tx = self.db.read().await?;
-            let rows =
-                query("SELECT view, leaf_hash, data FROM quorum_proposals ORDER BY view LIMIT $1 OFFSET $2")
-                    .bind(batch_size)
-                    .bind(offset)
-                    .fetch_all(tx.as_mut())
-                    .await?;
+            let rows = query(
+                "SELECT view, leaf_hash, data FROM quorum_proposals WHERE view >= $1 ORDER BY \
+                 view LIMIT $2",
+            )
+            .bind(offset)
+            .bind(batch_size)
+            .fetch_all(tx.as_mut())
+            .await?;
 
             drop(tx);
 
@@ -1599,18 +1819,32 @@ impl SequencerPersistence for Persistence {
             let mut query_builder: sqlx::QueryBuilder<Db> =
                 sqlx::QueryBuilder::new("INSERT INTO quorum_proposals2 (view, leaf_hash, data) ");
 
+            offset = values.last().context("last row")?.0;
             query_builder.push_values(values.into_iter(), |mut b, (view, leaf_hash, data)| {
                 b.push_bind(view).push_bind(leaf_hash).push_bind(data);
             });
+
+            query_builder.push(" ON CONFLICT DO NOTHING");
 
             let query = query_builder.build();
 
             let mut tx = self.db.write().await?;
             query.execute(tx.as_mut()).await?;
+
+            tx.upsert(
+                "epoch_migration",
+                ["table_name", "completed", "migrated_rows"],
+                ["table_name"],
+                [("quorum_proposals".to_string(), false, offset)],
+            )
+            .await?;
             tx.commit().await?;
 
-            offset += batch_size;
-            tracing::info!("quorum proposals migration progress: {} rows", offset);
+            tracing::info!(
+                "quorum proposals migration progress: rows={} offset={}",
+                rows.len(),
+                offset
+            );
 
             if rows.len() < batch_size as usize {
                 break;
@@ -1622,9 +1856,9 @@ impl SequencerPersistence for Persistence {
         let mut tx = self.db.write().await?;
         tx.upsert(
             "epoch_migration",
-            ["table_name", "completed"],
+            ["table_name", "completed", "migrated_rows"],
             ["table_name"],
-            [("quorum_proposals".to_string(), true)],
+            [("quorum_proposals".to_string(), true, offset)],
         )
         .await?;
         tx.commit().await?;
@@ -1636,11 +1870,11 @@ impl SequencerPersistence for Persistence {
 
     async fn migrate_quorum_certificates(&self) -> anyhow::Result<()> {
         let batch_size: i64 = 10000;
-        let mut offset: i64 = 0;
         let mut tx = self.db.read().await?;
 
-        let (is_completed,) = query_as::<(bool,)>(
-            "SELECT completed from epoch_migration WHERE table_name = 'quorum_certificate'",
+        let (is_completed, mut offset) = query_as::<(bool, i64)>(
+            "SELECT completed, migrated_rows from epoch_migration WHERE table_name = \
+             'quorum_certificate'",
         )
         .fetch_one(tx.as_mut())
         .await?;
@@ -1653,12 +1887,14 @@ impl SequencerPersistence for Persistence {
         tracing::warn!("migrating quorum certificates..");
         loop {
             let mut tx = self.db.read().await?;
-            let rows =
-                query("SELECT view, leaf_hash, data FROM quorum_certificate ORDER BY view LIMIT $1 OFFSET $2")
-                    .bind(batch_size)
-                    .bind(offset)
-                    .fetch_all(tx.as_mut())
-                    .await?;
+            let rows = query(
+                "SELECT view, leaf_hash, data FROM quorum_certificate WHERE view >= $1 ORDER BY \
+                 view LIMIT $2",
+            )
+            .bind(offset)
+            .bind(batch_size)
+            .fetch_all(tx.as_mut())
+            .await?;
 
             drop(tx);
             if rows.is_empty() {
@@ -1682,18 +1918,32 @@ impl SequencerPersistence for Persistence {
             let mut query_builder: sqlx::QueryBuilder<Db> =
                 sqlx::QueryBuilder::new("INSERT INTO quorum_certificate2 (view, leaf_hash, data) ");
 
+            offset = values.last().context("last row")?.0;
+
             query_builder.push_values(values.into_iter(), |mut b, (view, leaf_hash, data)| {
                 b.push_bind(view).push_bind(leaf_hash).push_bind(data);
             });
 
+            query_builder.push(" ON CONFLICT DO NOTHING");
             let query = query_builder.build();
 
             let mut tx = self.db.write().await?;
             query.execute(tx.as_mut()).await?;
-            tx.commit().await?;
-            offset += batch_size;
 
-            tracing::info!("Quorum certificates migration progress: {} rows", offset);
+            tx.upsert(
+                "epoch_migration",
+                ["table_name", "completed", "migrated_rows"],
+                ["table_name"],
+                [("quorum_certificate".to_string(), false, offset)],
+            )
+            .await?;
+            tx.commit().await?;
+
+            tracing::info!(
+                "Quorum certificates migration progress: rows={} offset={}",
+                rows.len(),
+                offset
+            );
 
             if rows.len() < batch_size as usize {
                 break;
@@ -1705,9 +1955,9 @@ impl SequencerPersistence for Persistence {
         let mut tx = self.db.write().await?;
         tx.upsert(
             "epoch_migration",
-            ["table_name", "completed"],
+            ["table_name", "completed", "migrated_rows"],
             ["table_name"],
-            [("quorum_certificate".to_string(), true)],
+            [("quorum_certificate".to_string(), true, offset)],
         )
         .await?;
         tx.commit().await?;
@@ -1759,6 +2009,7 @@ impl SequencerPersistence for Persistence {
         let view = data.view_number().u64();
         let data_bytes = bincode::serialize(proposal).unwrap();
 
+        let now = Instant::now();
         let mut tx = self.db.write().await?;
         tx.upsert(
             "da_proposal2",
@@ -1767,10 +2018,14 @@ impl SequencerPersistence for Persistence {
             [(view as i64, data_bytes, vid_commit.to_string())],
         )
         .await?;
-        tx.commit().await
+        let res = tx.commit().await;
+        self.internal_metrics
+            .internal_append_da2_duration
+            .add_point(now.elapsed().as_secs_f64());
+        res
     }
 
-    async fn add_drb_result(
+    async fn store_drb_result(
         &self,
         epoch: EpochNumber,
         drb_result: DrbResult,
@@ -1787,7 +2042,7 @@ impl SequencerPersistence for Persistence {
         tx.commit().await
     }
 
-    async fn add_epoch_root(
+    async fn store_epoch_root(
         &self,
         epoch: EpochNumber,
         block_header: <SeqTypes as NodeType>::BlockHeader,
@@ -1806,9 +2061,55 @@ impl SequencerPersistence for Persistence {
         tx.commit().await
     }
 
+    async fn store_drb_input(&self, drb_input: DrbInput) -> anyhow::Result<()> {
+        if let Ok(loaded_drb_input) = self.load_drb_input(drb_input.epoch).await {
+            if loaded_drb_input.iteration >= drb_input.iteration {
+                anyhow::bail!(
+                    "DrbInput in storage {:?} is more recent than {:?}, refusing to update",
+                    loaded_drb_input,
+                    drb_input
+                )
+            }
+        }
+
+        let drb_input_bytes = bincode::serialize(&drb_input)
+            .context("Failed to serialize DrbInput. This is not fatal, but should never happen.")?;
+
+        let mut tx = self.db.write().await?;
+
+        tx.upsert(
+            "drb",
+            ["epoch", "drb_input"],
+            ["epoch"],
+            [(drb_input.epoch as i64, drb_input_bytes)],
+        )
+        .await?;
+        tx.commit().await
+    }
+
+    async fn load_drb_input(&self, epoch: u64) -> anyhow::Result<DrbInput> {
+        let row = self
+            .db
+            .read()
+            .await?
+            .fetch_optional(query("SELECT drb_input FROM drb WHERE epoch = $1").bind(epoch as i64))
+            .await?;
+
+        match row {
+            None => anyhow::bail!("No DrbInput for epoch {} in storage", epoch),
+            Some(row) => {
+                let drb_input_bytes: Vec<u8> = row.try_get("drb_input")?;
+                let drb_input = bincode::deserialize(&drb_input_bytes)
+                    .context("Failed to deserialize drb_input from storage")?;
+
+                Ok(drb_input)
+            },
+        }
+    }
+
     async fn add_state_cert(
         &self,
-        state_cert: LightClientStateUpdateCertificate<SeqTypes>,
+        state_cert: LightClientStateUpdateCertificateV2<SeqTypes>,
     ) -> anyhow::Result<()> {
         let state_cert_bytes = bincode::serialize(&state_cert)
             .context("serializing light client state update certificate")?;
@@ -1816,9 +2117,12 @@ impl SequencerPersistence for Persistence {
         let mut tx = self.db.write().await?;
         tx.upsert(
             "state_cert",
-            ["epoch", "state_cert"],
-            ["epoch"],
-            [(state_cert.epoch.u64() as i64, state_cert_bytes)],
+            ["view", "state_cert"],
+            ["view"],
+            [(
+                state_cert.light_client_state.view_number as i64,
+                state_cert_bytes,
+            )],
         )
         .await?;
         tx.commit().await
@@ -1826,20 +2130,39 @@ impl SequencerPersistence for Persistence {
 
     async fn load_state_cert(
         &self,
-    ) -> anyhow::Result<Option<LightClientStateUpdateCertificate<SeqTypes>>> {
+    ) -> anyhow::Result<Option<LightClientStateUpdateCertificateV2<SeqTypes>>> {
         let Some(row) = self
             .db
             .read()
             .await?
-            .fetch_optional("SELECT state_cert from state_cert ORDER BY epoch DESC LIMIT 1")
+            .fetch_optional(
+                "SELECT state_cert FROM finalized_state_cert ORDER BY epoch DESC LIMIT 1",
+            )
             .await?
         else {
             return Ok(None);
         };
         let bytes: Vec<u8> = row.get("state_cert");
-        bincode::deserialize(&bytes)
-            .context("deserializing light client state update certificate")
-            .map(Some)
+
+        let cert = match bincode::deserialize(&bytes) {
+            Ok(cert) => cert,
+            Err(err) => {
+                tracing::info!(
+                    error = %err,
+                    "Failed to deserialize state certificate with v2. attempting with v1"
+                );
+
+                let v1_cert =
+                    bincode::deserialize::<LightClientStateUpdateCertificateV1<SeqTypes>>(&bytes)
+                        .with_context(|| {
+                        format!("Failed to deserialize using both v1 and v2. error: {err}")
+                    })?;
+
+                v1_cert.into()
+            },
+        };
+
+        Ok(Some(cert))
     }
 
     async fn load_start_epoch_info(&self) -> anyhow::Result<Vec<InitializerEpochInfo<SeqTypes>>> {
@@ -1847,14 +2170,19 @@ impl SequencerPersistence for Persistence {
             .db
             .read()
             .await?
-            .fetch_all("SELECT * from epoch_drb_and_root ORDER BY epoch ASC")
+            .fetch_all(
+                query("SELECT * from epoch_drb_and_root ORDER BY epoch DESC LIMIT $1")
+                    .bind(RECENT_STAKE_TABLES_LIMIT as i64),
+            )
             .await?;
 
+        // reverse the rows vector to return the most recent epochs, but in ascending order
         rows.into_iter()
+            .rev()
             .map(|row| {
-                let epoch: i64 = row.get("epoch");
-                let drb_result: Option<Vec<u8>> = row.get("drb_result");
-                let block_header: Option<Vec<u8>> = row.get("block_header");
+                let epoch: i64 = row.try_get("epoch")?;
+                let drb_result: Option<Vec<u8>> = row.try_get("drb_result")?;
+                let block_header: Option<Vec<u8>> = row.try_get("block_header")?;
                 if let Some(drb_result) = drb_result {
                     let drb_result_array = drb_result
                         .try_into()
@@ -1880,6 +2208,10 @@ impl SequencerPersistence for Persistence {
             })
             .collect()
     }
+
+    fn enable_metrics(&mut self, metrics: &dyn Metrics) {
+        self.internal_metrics = PersistenceMetricsValue::new(metrics);
+    }
 }
 
 #[async_trait]
@@ -1887,30 +2219,38 @@ impl MembershipPersistence for Persistence {
     async fn load_stake(
         &self,
         epoch: EpochNumber,
-    ) -> anyhow::Result<Option<IndexMap<alloy::primitives::Address, Validator<BLSPubKey>>>> {
+    ) -> anyhow::Result<Option<(ValidatorMap, Option<RewardAmount>)>> {
         let result = self
             .db
             .read()
             .await?
             .fetch_optional(
-                query("SELECT stake FROM epoch_drb_and_root WHERE epoch = $1")
+                query("SELECT stake, block_reward FROM epoch_drb_and_root WHERE epoch = $1")
                     .bind(epoch.u64() as i64),
             )
             .await?;
 
         result
             .map(|row| {
-                let bytes: Vec<u8> = row.get("stake");
-                bincode::deserialize(&bytes).context("deserializing stake table")
+                let stake_table_bytes: Vec<u8> = row.get("stake");
+                let reward_bytes: Option<Vec<u8>> = row.get("block_reward");
+                let stake_table = bincode::deserialize(&stake_table_bytes)
+                    .context("deserializing stake table")?;
+                let reward: Option<RewardAmount> = reward_bytes
+                    .map(|b| bincode::deserialize(&b).context("deserializing block_reward"))
+                    .transpose()?;
+
+                Ok((stake_table, reward))
             })
             .transpose()
     }
 
     async fn load_latest_stake(&self, limit: u64) -> anyhow::Result<Option<Vec<IndexedStake>>> {
-        let mut tx = self.db.write().await?;
+        let mut tx = self.db.read().await?;
 
-        let rows = match query_as::<(i64, Vec<u8>)>(
-            "SELECT epoch, stake FROM epoch_drb_and_root LIMIT $1",
+        let rows = match query_as::<(i64, Vec<u8>, Option<Vec<u8>>)>(
+            "SELECT epoch, stake, block_reward FROM epoch_drb_and_root ORDER BY epoch DESC LIMIT \
+             $1",
         )
         .bind(limit as i64)
         .fetch_all(tx.as_mut())
@@ -1923,31 +2263,245 @@ impl MembershipPersistence for Persistence {
             },
         };
 
-        rows.into_iter()
-            .map(|(id, bytes)| -> anyhow::Result<_> {
-                let st = bincode::deserialize(&bytes).context("deserializing stake table")?;
-                Ok(Some((EpochNumber::new(id as u64), st)))
+        let stakes: anyhow::Result<Vec<IndexedStake>> = rows
+            .into_iter()
+            .map(|(id, stake_bytes, reward_bytes_opt)| {
+                let stake_table: ValidatorMap =
+                    bincode::deserialize(&stake_bytes).context("deserializing stake table")?;
+
+                let block_reward: Option<RewardAmount> = reward_bytes_opt
+                    .map(|b| bincode::deserialize(&b).context("deserializing block_reward"))
+                    .transpose()?;
+
+                Ok((EpochNumber::new(id as u64), (stake_table, block_reward)))
             })
-            .collect()
+            .collect();
+
+        Ok(Some(stakes?))
     }
 
     async fn store_stake(
         &self,
         epoch: EpochNumber,
-        stake: IndexMap<alloy::primitives::Address, Validator<BLSPubKey>>,
+        stake: ValidatorMap,
+        block_reward: Option<RewardAmount>,
     ) -> anyhow::Result<()> {
         let mut tx = self.db.write().await?;
 
-        let stake_table_bytes = bincode::serialize(&stake).context("serializing stake table")?;
-
+        let stake_table_bytes =
+            bincode::serialize(&(stake, block_reward)).context("serializing stake table")?;
+        let reward_bytes = block_reward
+            .map(|r| bincode::serialize(&r).context("serializing block reward"))
+            .transpose()?;
         tx.upsert(
             "epoch_drb_and_root",
-            ["epoch", "stake"],
+            ["epoch", "stake", "block_reward"],
             ["epoch"],
-            [(epoch.u64() as i64, stake_table_bytes)],
+            [(epoch.u64() as i64, stake_table_bytes, reward_bytes)],
         )
         .await?;
         tx.commit().await
+    }
+
+    async fn store_events(
+        &self,
+        l1_finalized: u64,
+        events: Vec<(EventKey, StakeTableEvent)>,
+    ) -> anyhow::Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.db.write().await?;
+
+        // check last l1 block if there is any
+        let last_processed_l1_block = query_as::<(i64,)>(
+            "SELECT last_l1_block FROM stake_table_events_l1_block where id = 0",
+        )
+        .fetch_optional(tx.as_mut())
+        .await?
+        .map(|(l1,)| l1);
+
+        tracing::debug!("last l1 finalizes in database = {last_processed_l1_block:?}");
+
+        // skip events storage if the database already has higher l1 block events
+        if last_processed_l1_block > Some(l1_finalized.try_into()?) {
+            tracing::debug!(
+                ?last_processed_l1_block,
+                ?l1_finalized,
+                ?events,
+                "last l1 finalized stored is already higher"
+            );
+            return Ok(());
+        }
+
+        let mut query_builder: sqlx::QueryBuilder<Db> =
+            sqlx::QueryBuilder::new("INSERT INTO stake_table_events (l1_block, log_index, event) ");
+
+        let events = events
+            .into_iter()
+            .map(|((block_number, index), event)| {
+                Ok((
+                    i64::try_from(block_number)?,
+                    i64::try_from(index)?,
+                    serde_json::to_value(event).context("l1 event to value")?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        query_builder.push_values(events.into_iter(), |mut b, (l1_block, log_index, event)| {
+            b.push_bind(l1_block).push_bind(log_index).push_bind(event);
+        });
+
+        query_builder.push(" ON CONFLICT DO NOTHING");
+        let query = query_builder.build();
+
+        query.execute(tx.as_mut()).await?;
+
+        // update l1 block
+        tx.upsert(
+            "stake_table_events_l1_block",
+            ["id", "last_l1_block"],
+            ["id"],
+            [(0_i32, l1_finalized as i64)],
+        )
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    /// Loads all events from persistent storage up to the specified L1 block.
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple containing:
+    /// - `Option<u64>` - The queried L1 block for which all events have been successfully fetched.
+    /// - `Vec<(EventKey, StakeTableEvent)>` - A list of events, where each entry is a tuple of the event key
+    /// event key is (l1 block number, log index)
+    ///   and the corresponding StakeTable event.
+    ///
+    async fn load_events(
+        &self,
+        to_l1_block: u64,
+    ) -> anyhow::Result<(
+        Option<EventsPersistenceRead>,
+        Vec<(EventKey, StakeTableEvent)>,
+    )> {
+        let mut tx = self.db.read().await?;
+
+        // check last l1 block if there is any
+        let res = query_as::<(i64,)>(
+            "SELECT last_l1_block FROM stake_table_events_l1_block where id = 0",
+        )
+        .fetch_optional(tx.as_mut())
+        .await?;
+
+        let Some((last_processed_l1_block,)) = res else {
+            // this just means we dont have any events stored
+            return Ok((None, Vec::new()));
+        };
+
+        // Determine the L1 block for querying events.
+        // If the last stored L1 block is greater than the requested block, limit the query to the requested block.
+        // Otherwise, query up to the last stored block.
+        let to_l1_block = to_l1_block.try_into()?;
+        let query_l1_block = if last_processed_l1_block > to_l1_block {
+            to_l1_block
+        } else {
+            last_processed_l1_block
+        };
+
+        let rows = query(
+            "SELECT l1_block, log_index, event FROM stake_table_events WHERE l1_block <= $1 ORDER \
+             BY l1_block ASC, log_index ASC",
+        )
+        .bind(query_l1_block)
+        .fetch_all(tx.as_mut())
+        .await?;
+
+        let events = rows
+            .into_iter()
+            .map(|row| {
+                let l1_block: i64 = row.try_get("l1_block")?;
+                let log_index: i64 = row.try_get("log_index")?;
+                let event = serde_json::from_value(row.try_get("event")?)?;
+
+                Ok(((l1_block.try_into()?, log_index.try_into()?), event))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // Determine the read state based on the queried block range.
+        // - If the persistence returned events up to the requested block, the read is complete.
+        // - Otherwise, indicate that the read is up to the last processed block.
+        if query_l1_block == to_l1_block {
+            Ok((Some(EventsPersistenceRead::Complete), events))
+        } else {
+            Ok((
+                Some(EventsPersistenceRead::UntilL1Block(
+                    query_l1_block.try_into()?,
+                )),
+                events,
+            ))
+        }
+    }
+}
+
+#[async_trait]
+impl DhtPersistentStorage for Persistence {
+    /// Save the DHT to the database
+    ///
+    /// # Errors
+    /// - If we fail to serialize the records
+    /// - If we fail to write the serialized records to the DB
+    async fn save(&self, records: Vec<SerializableRecord>) -> anyhow::Result<()> {
+        // Bincode-serialize the records
+        let to_save =
+            bincode::serialize(&records).with_context(|| "failed to serialize records")?;
+
+        // Prepare the statement
+        let stmt = "INSERT INTO libp2p_dht (id, serialized_records) VALUES (0, $1) ON CONFLICT \
+                    (id) DO UPDATE SET serialized_records = $1";
+
+        // Execute the query
+        let mut tx = self
+            .db
+            .write()
+            .await
+            .with_context(|| "failed to start an atomic DB transaction")?;
+        tx.execute(query(stmt).bind(to_save))
+            .await
+            .with_context(|| "failed to execute DB query")?;
+
+        // Commit the state
+        tx.commit().await.with_context(|| "failed to commit to DB")
+    }
+
+    /// Load the DHT from the database
+    ///
+    /// # Errors
+    /// - If we fail to read from the DB
+    /// - If we fail to deserialize the records
+    async fn load(&self) -> anyhow::Result<Vec<SerializableRecord>> {
+        // Fetch the results from the DB
+        let result = self
+            .db
+            .read()
+            .await
+            .with_context(|| "failed to start a DB read transaction")?
+            .fetch_one("SELECT * FROM libp2p_dht where id = 0")
+            .await
+            .with_context(|| "failed to fetch from DB")?;
+
+        // Get the `serialized_records` row
+        let serialied_records: Vec<u8> = result.get("serialized_records");
+
+        // Deserialize it
+        let records: Vec<SerializableRecord> = bincode::deserialize(&serialied_records)
+            .with_context(|| "Failed to deserialize records")?;
+
+        Ok(records)
     }
 }
 
@@ -2106,7 +2660,8 @@ async fn fetch_leaf_from_proposals<Mode: TransactionMode>(
 mod testing {
     use hotshot_query_service::data_source::storage::sql::testing::TmpDb;
 
-    use super::{super::testing::TestablePersistence, *};
+    use super::*;
+    use crate::persistence::tests::TestablePersistence;
 
     #[async_trait]
     impl TestablePersistence for Persistence {
@@ -2142,16 +2697,6 @@ mod testing {
 }
 
 #[cfg(test)]
-mod generic_tests {
-    use super::{super::persistence_tests, Persistence};
-    // For some reason this is the only way to import the macro defined in another module of this
-    // crate.
-    use crate::*;
-
-    instantiate_persistence_tests!(Persistence);
-}
-
-#[cfg(test)]
 mod test {
 
     use committable::{Commitment, CommitmentBoundsArkless};
@@ -2160,15 +2705,16 @@ mod test {
     use hotshot_example_types::node_types::TestVersions;
     use hotshot_types::{
         data::{
-            ns_table::parse_ns_table, vid_commitment, vid_disperse::VidDisperseShare2, EpochNumber,
-            QuorumProposal2,
+            ns_table::parse_ns_table, vid_disperse::VidDisperseShare2, EpochNumber, QuorumProposal2,
         },
         message::convert_proposal,
         simple_certificate::QuorumCertificate,
         simple_vote::QuorumData,
         traits::{
-            block_contents::BlockHeader, node_implementation::Versions,
-            signature_key::SignatureKey, EncodeBytes,
+            block_contents::{BlockHeader, GENESIS_VID_NUM_STORAGE_NODES},
+            node_implementation::Versions,
+            signature_key::SignatureKey,
+            EncodeBytes,
         },
         utils::EpochTransitionIndicator,
         vid::{
@@ -2177,16 +2723,13 @@ mod test {
         },
     };
     use jf_vid::VidScheme;
-    use sequencer_utils::test_utils::setup_test;
     use vbs::version::StaticVersionType;
 
     use super::*;
-    use crate::{persistence::testing::TestablePersistence, BLSPubKey, PubKey};
+    use crate::{persistence::tests::TestablePersistence as _, BLSPubKey, PubKey};
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_quorum_proposals_leaf_hash_migration() {
-        setup_test();
-
         // Create some quorum proposals to test with.
         let leaf: Leaf2 =
             Leaf::genesis::<TestVersions>(&ValidatedState::default(), &NodeState::mock())
@@ -2209,6 +2752,7 @@ mod test {
                 view_change_evidence: None,
                 next_drb_result: None,
                 next_epoch_justify_qc: None,
+                state_cert: None,
             },
             signature,
             _pd: Default::default(),
@@ -2263,10 +2807,8 @@ mod test {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_fetching_providers() {
-        setup_test();
-
         let tmp = Persistence::tmp_storage().await;
         let storage = Persistence::connect(&tmp).await;
 
@@ -2310,6 +2852,7 @@ mod test {
                 next_drb_result: None,
                 next_epoch_justify_qc: None,
                 epoch: None,
+                state_cert: None,
             },
         };
         let quorum_proposal_signature =
@@ -2405,8 +2948,6 @@ mod test {
     /// different configurations that can achieve this behavior, such that the data is retained and
     /// then pruned due to different logic and code paths.
     async fn test_pruning_helper(pruning_opt: ConsensusPruningOptions) {
-        setup_test();
-
         let tmp = Persistence::tmp_storage().await;
         let mut opt = Persistence::options(&tmp);
         opt.consensus_pruning = pruning_opt;
@@ -2458,6 +2999,7 @@ mod test {
                 view_change_evidence: None,
                 next_drb_result: None,
                 next_epoch_justify_qc: None,
+                state_cert: None,
             },
         };
         let quorum_proposal_signature =
@@ -2526,7 +3068,7 @@ mod test {
         storage.load_quorum_proposal(data_view).await.unwrap_err();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_pruning_minimum_retention() {
         test_pruning_helper(ConsensusPruningOptions {
             // Use a very low target usage, to show that we still retain data up to the minimum
@@ -2540,7 +3082,7 @@ mod test {
         .await
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_pruning_target_retention() {
         test_pruning_helper(ConsensusPruningOptions {
             target_retention: 1,
@@ -2554,10 +3096,8 @@ mod test {
         .await
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_consensus_migration() {
-        setup_test();
-
         let tmp = Persistence::tmp_storage().await;
         let mut opt = Persistence::options(&tmp);
 
@@ -2577,29 +3117,11 @@ mod test {
                 Payload::from_transactions([], &validated_state, &instance_state)
                     .await
                     .unwrap();
-            let builder_commitment = payload.builder_commitment(&metadata);
+
             let payload_bytes = payload.encode();
 
-            let payload_commitment = vid_commitment::<TestVersions>(
-                &payload_bytes,
-                &metadata.encode(),
-                4,
-                <TestVersions as Versions>::Base::VERSION,
-            );
-
-            let block_header = Header::genesis(
-                &instance_state,
-                payload_commitment,
-                builder_commitment,
-                metadata,
-            );
-
-            let state_cert = LightClientStateUpdateCertificate::<SeqTypes> {
-                epoch: EpochNumber::new(i),
-                light_client_state: Default::default(), // filling arbitrary value
-                signatures: vec![],                     // filling arbitrary value
-            };
-            assert!(storage.add_state_cert(state_cert).await.is_ok());
+            let block_header =
+                Header::genesis::<TestVersions>(&instance_state, payload.clone(), &metadata);
 
             let null_quorum_data = QuorumData {
                 leaf_commit: Commitment::<Leaf>::default_commitment_no_preimage(),
@@ -2638,7 +3160,7 @@ mod test {
             let mut leaf = Leaf::from_quorum_proposal(&quorum_proposal);
             leaf.fill_block_payload::<TestVersions>(
                 payload,
-                4,
+                GENESIS_VID_NUM_STORAGE_NODES,
                 <TestVersions as Versions>::Base::VERSION,
             )
             .unwrap();
@@ -2656,9 +3178,30 @@ mod test {
             )
             .await
             .unwrap();
+
+            let state_cert = LightClientStateUpdateCertificateV2::<SeqTypes> {
+                epoch: EpochNumber::new(i),
+                light_client_state: Default::default(), // filling arbitrary value
+                next_stake_table_state: Default::default(), // filling arbitrary value
+                signatures: vec![],                     // filling arbitrary value
+                auth_root: Default::default(),
+            };
+            // manually upsert the state cert to the finalized database
+            let state_cert_bytes = bincode::serialize(&state_cert).unwrap();
+            tx.upsert(
+                "finalized_state_cert",
+                ["epoch", "state_cert"],
+                ["epoch"],
+                [(i as i64, state_cert_bytes)],
+            )
+            .await
+            .unwrap();
+
             tx.commit().await.unwrap();
 
-            let disperse = advz_scheme(4).disperse(payload_bytes.clone()).unwrap();
+            let disperse = advz_scheme(GENESIS_VID_NUM_STORAGE_NODES)
+                .disperse(payload_bytes.clone())
+                .unwrap();
 
             let vid = ADVZDisperseShare::<SeqTypes> {
                 view_number: ViewNumber::new(i),
@@ -2778,7 +3321,7 @@ mod test {
             "quorum certificates count does not match rows",
         );
 
-        let (state_cert_count,) = query_as::<(i64,)>("SELECT COUNT(*) from state_cert")
+        let (state_cert_count,) = query_as::<(i64,)>("SELECT COUNT(*) from finalized_state_cert")
             .fetch_one(tx.as_mut())
             .await
             .unwrap();
@@ -2788,47 +3331,153 @@ mod test {
         );
         assert_eq!(
             storage.load_state_cert().await.unwrap().unwrap(),
-            LightClientStateUpdateCertificate::<SeqTypes> {
+            LightClientStateUpdateCertificateV2::<SeqTypes> {
                 epoch: EpochNumber::new(rows - 1),
                 light_client_state: Default::default(),
-                signatures: vec![]
+                next_stake_table_state: Default::default(),
+                signatures: vec![],
+                auth_root: Default::default(),
             },
             "Wrong light client state update certificate in the storage",
-        )
-    }
+        );
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_membership_persistence() -> anyhow::Result<()> {
-        setup_test();
+        storage.migrate_consensus().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(feature = "embedded-db"))]
+mod postgres_tests {
+    use espresso_types::{FeeAccount, Header, Leaf, NodeState, Transaction as Tx};
+    use hotshot_example_types::node_types::TestVersions;
+    use hotshot_query_service::{
+        availability::BlockQueryData, data_source::storage::UpdateAvailabilityStorage,
+    };
+    use hotshot_types::{
+        data::vid_commitment,
+        simple_certificate::QuorumCertificate,
+        traits::{
+            block_contents::{BlockHeader, BuilderFee, GENESIS_VID_NUM_STORAGE_NODES},
+            election::Membership,
+            signature_key::BuilderSignatureKey,
+            EncodeBytes,
+        },
+    };
+
+    use super::*;
+    use crate::persistence::tests::TestablePersistence as _;
+
+    async fn test_postgres_read_ns_table(instance_state: NodeState) {
+        instance_state
+            .coordinator
+            .membership()
+            .write()
+            .await
+            .set_first_epoch(EpochNumber::genesis(), Default::default());
 
         let tmp = Persistence::tmp_storage().await;
         let mut opt = Persistence::options(&tmp);
-
         let storage = opt.create().await.unwrap();
 
-        let validator = Validator::mock();
-        let mut st = IndexMap::new();
-        st.insert(validator.account, validator);
-        storage
-            .store_stake(EpochNumber::new(10), st.clone())
-            .await?;
+        let txs = [
+            Tx::new(10001u32.into(), vec![1, 2, 3]),
+            Tx::new(10001u32.into(), vec![4, 5, 6]),
+            Tx::new(10009u32.into(), vec![7, 8, 9]),
+        ];
 
-        let table = storage.load_stake(EpochNumber::new(10)).await?.unwrap();
-        assert_eq!(st, table);
+        let validated_state = Default::default();
+        let justify_qc =
+            QuorumCertificate::genesis::<TestVersions>(&validated_state, &instance_state).await;
+        let view_number: ViewNumber = justify_qc.view_number + 1;
+        let parent_leaf = Leaf::genesis::<TestVersions>(&validated_state, &instance_state)
+            .await
+            .into();
 
-        let val2 = Validator::mock();
-        let mut st2 = IndexMap::new();
-        st2.insert(val2.account, val2);
-        storage
-            .store_stake(EpochNumber::new(11), st2.clone())
-            .await?;
+        let (payload, ns_table) =
+            Payload::from_transactions(txs.clone(), &validated_state, &instance_state)
+                .await
+                .unwrap();
+        let payload_bytes = payload.encode();
+        let payload_commitment = vid_commitment::<TestVersions>(
+            &payload_bytes,
+            &ns_table.encode(),
+            GENESIS_VID_NUM_STORAGE_NODES,
+            instance_state.current_version,
+        );
+        let builder_commitment = payload.builder_commitment(&ns_table);
+        let (fee_account, fee_key) = FeeAccount::generated_from_seed_indexed([0; 32], 0);
+        let fee_amount = 0;
+        let fee_signature = FeeAccount::sign_fee(&fee_key, fee_amount, &ns_table).unwrap();
+        let block_header = Header::new(
+            &validated_state,
+            &instance_state,
+            &parent_leaf,
+            payload_commitment,
+            builder_commitment,
+            ns_table,
+            BuilderFee {
+                fee_amount,
+                fee_account,
+                fee_signature,
+            },
+            instance_state.current_version,
+            view_number.u64(),
+        )
+        .await
+        .unwrap();
+        let proposal = QuorumProposal {
+            block_header: block_header.clone(),
+            view_number,
+            justify_qc: justify_qc.clone(),
+            upgrade_certificate: None,
+            proposal_certificate: None,
+        };
+        let leaf: Leaf2 = Leaf::from_quorum_proposal(&proposal).into();
+        let mut qc = justify_qc.to_qc2();
+        qc.data.leaf_commit = leaf.commit();
+        qc.view_number = view_number;
 
-        let tables = storage.load_latest_stake(4).await?.unwrap();
-        let mut iter = tables.iter();
-        assert_eq!(Some(&(EpochNumber::new(10), st)), iter.next());
-        assert_eq!(Some(&(EpochNumber::new(11), st2)), iter.next());
-        assert_eq!(None, iter.next());
+        let mut tx = storage.db.write().await.unwrap();
+        tx.insert_leaf(LeafQueryData::new(leaf, qc).unwrap())
+            .await
+            .unwrap();
+        tx.insert_block(BlockQueryData::<SeqTypes>::new(block_header, payload))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
 
-        Ok(())
+        let mut tx = storage.db.read().await.unwrap();
+        let rows = query(
+            "
+            SELECT ns_id, read_ns_id(get_ns_table(h.data), t.ns_index) AS read_ns_id
+              FROM header AS h
+              JOIN transactions AS t ON t.block_height = h.height
+              ORDER BY t.ns_index, t.position
+        ",
+        )
+        .fetch_all(tx.as_mut())
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), txs.len());
+        for (i, row) in rows.into_iter().enumerate() {
+            let ns = u64::from(txs[i].namespace()) as i64;
+            assert_eq!(row.get::<i64, _>("ns_id"), ns);
+            assert_eq!(row.get::<i64, _>("read_ns_id"), ns);
+        }
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_postgres_read_ns_table_v0_1() {
+        test_postgres_read_ns_table(NodeState::mock()).await;
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_postgres_read_ns_table_v0_2() {
+        test_postgres_read_ns_table(NodeState::mock_v2()).await;
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_postgres_read_ns_table_v0_3() {
+        test_postgres_read_ns_table(NodeState::mock_v3().with_epoch_height(0)).await;
     }
 }

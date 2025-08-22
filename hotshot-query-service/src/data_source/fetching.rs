@@ -118,13 +118,17 @@ use super::{
 };
 use crate::{
     availability::{
-        AvailabilityDataSource, BlockId, BlockInfo, BlockQueryData, Fetch, FetchStream,
-        HeaderQueryData, LeafId, LeafQueryData, PayloadMetadata, PayloadQueryData, QueryableHeader,
-        QueryablePayload, TransactionHash, TransactionQueryData, UpdateAvailabilityData,
-        VidCommonMetadata, VidCommonQueryData,
+        AvailabilityDataSource, BlockId, BlockInfo, BlockQueryData, BlockWithTransaction, Fetch,
+        FetchStream, HeaderQueryData, LeafId, LeafQueryData, NamespaceId, PayloadMetadata,
+        PayloadQueryData, QueryableHeader, QueryablePayload, StateCertQueryDataV2, TransactionHash,
+        UpdateAvailabilityData, VidCommonMetadata, VidCommonQueryData,
     },
     explorer::{self, ExplorerDataSource},
-    fetching::{self, request, Provider},
+    fetching::{
+        self,
+        request::{self, StateCertRequest},
+        Provider,
+    },
     merklized_state::{
         MerklizedState, MerklizedStateDataSource, MerklizedStateHeightPersistence, Snapshot,
     },
@@ -139,6 +143,7 @@ use crate::{
 mod block;
 mod header;
 mod leaf;
+mod state_cert;
 mod transaction;
 mod vid;
 
@@ -165,6 +170,7 @@ pub struct Builder<Types, S, P> {
     proactive_fetching: bool,
     aggregator: bool,
     aggregator_chunk_size: Option<usize>,
+    types_migration_batch_size: u64,
     leaf_only: bool,
     _types: PhantomData<Types>,
 }
@@ -202,6 +208,7 @@ impl<Types, S, P> Builder<Types, S, P> {
             proactive_fetching: true,
             aggregator: true,
             aggregator_chunk_size: None,
+            types_migration_batch_size: 10000,
             leaf_only: false,
             _types: Default::default(),
         }
@@ -364,6 +371,14 @@ impl<Types, S, P> Builder<Types, S, P> {
         self
     }
 
+    /// Sets the batch size for the types migration.
+    /// Determines how many `(leaf, vid)` rows are selected from the old types table
+    /// and migrated at once.
+    pub fn with_types_migration_batch_size(mut self, batch: u64) -> Self {
+        self.types_migration_batch_size = batch;
+        self
+    }
+
     pub fn is_leaf_only(&self) -> bool {
         self.leaf_only
     }
@@ -375,8 +390,10 @@ where
     Payload<Types>: QueryablePayload<Types>,
     Header<Types>: QueryableHeader<Types>,
     S: PruneStorage + VersionedDataSource + HasMetrics + MigrateTypes<Types> + 'static,
-    for<'a> S::ReadOnly<'a>:
-        AvailabilityStorage<Types> + PrunedHeightStorage + NodeStorage<Types> + AggregatesStorage,
+    for<'a> S::ReadOnly<'a>: AvailabilityStorage<Types>
+        + PrunedHeightStorage
+        + NodeStorage<Types>
+        + AggregatesStorage<Types>,
     for<'a> S::Transaction<'a>: UpdateAvailabilityStorage<Types> + UpdateAggregatesStorage<Types>,
     P: AvailabilityProvider<Types>,
 {
@@ -433,6 +450,7 @@ where
 impl<Types, S> Pruner<Types, S>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
     S: PruneStorage + Send + Sync + 'static,
 {
@@ -489,8 +507,10 @@ where
     Header<Types>: QueryableHeader<Types>,
     S: VersionedDataSource + PruneStorage + HasMetrics + MigrateTypes<Types> + 'static,
     for<'a> S::Transaction<'a>: UpdateAvailabilityStorage<Types> + UpdateAggregatesStorage<Types>,
-    for<'a> S::ReadOnly<'a>:
-        AvailabilityStorage<Types> + NodeStorage<Types> + PrunedHeightStorage + AggregatesStorage,
+    for<'a> S::ReadOnly<'a>: AvailabilityStorage<Types>
+        + NodeStorage<Types>
+        + PrunedHeightStorage
+        + AggregatesStorage<Types>,
     P: AvailabilityProvider<Types>,
 {
     /// Build a [`FetchingDataSource`] with the given `storage` and `provider`.
@@ -511,6 +531,7 @@ where
         let proactive_range_chunk_size = builder
             .proactive_range_chunk_size
             .unwrap_or(builder.range_chunk_size);
+        let migration_batch_size = builder.types_migration_batch_size;
         let scanner_metrics = ScannerMetrics::new(builder.storage.metrics());
         let aggregator_metrics = AggregatorMetrics::new(builder.storage.metrics());
 
@@ -520,7 +541,7 @@ where
         // This is a one-time operation that should be done before starting the data source
         // It migrates leaf1 storage to leaf2
         // and vid to vid2
-        fetcher.storage.migrate_types().await?;
+        fetcher.storage.migrate_types(migration_batch_size).await?;
 
         let scanner = if proactive_fetching && !leaf_only {
             Some(BackgroundTask::spawn(
@@ -560,6 +581,11 @@ where
 
         Ok(ds)
     }
+
+    /// Get a copy of the (shared) inner storage
+    pub fn inner(&self) -> Arc<S> {
+        self.fetcher.storage.clone()
+    }
 }
 
 impl<Types, S, P> AsRef<S> for FetchingDataSource<Types, S, P>
@@ -585,6 +611,7 @@ where
 impl<Types, S, P> StatusDataSource for FetchingDataSource<Types, S, P>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     S: VersionedDataSource + HasMetrics + Send + Sync + 'static,
     for<'a> S::ReadOnly<'a>: NodeStorage<Types>,
     P: Send + Sync,
@@ -615,6 +642,7 @@ where
 impl<Types, S, P> AvailabilityDataSource<Types> for FetchingDataSource<Types, S, P>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
     S: VersionedDataSource + 'static,
     for<'a> S::Transaction<'a>: UpdateAvailabilityStorage<Types>,
@@ -777,17 +805,22 @@ where
         self.fetcher.clone().get_range_rev(start, end)
     }
 
-    async fn get_transaction(
+    async fn get_block_containing_transaction(
         &self,
-        hash: TransactionHash<Types>,
-    ) -> Fetch<TransactionQueryData<Types>> {
-        self.fetcher.get(TransactionRequest::from(hash)).await
+        h: TransactionHash<Types>,
+    ) -> Fetch<BlockWithTransaction<Types>> {
+        self.fetcher.clone().get(TransactionRequest::from(h)).await
+    }
+
+    async fn get_state_cert(&self, epoch: u64) -> Fetch<StateCertQueryDataV2<Types>> {
+        self.fetcher.get(StateCertRequest::from(epoch)).await
     }
 }
 
 impl<Types, S, P> UpdateAvailabilityData<Types> for FetchingDataSource<Types, S, P>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
     S: VersionedDataSource + 'static,
     for<'a> S::Transaction<'a>: UpdateAvailabilityStorage<Types>,
@@ -902,6 +935,7 @@ where
 impl<Types, S, P> Fetcher<Types, S, P>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     S: VersionedDataSource + Sync,
     for<'a> S::ReadOnly<'a>: PrunedHeightStorage + NodeStorage<Types>,
 {
@@ -947,6 +981,7 @@ where
 impl<Types, S, P> Fetcher<Types, S, P>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
     S: VersionedDataSource + 'static,
     for<'a> S::Transaction<'a>: UpdateAvailabilityStorage<Types>,
@@ -1561,11 +1596,14 @@ where
 impl<Types, S, P> Fetcher<Types, S, P>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
     S: VersionedDataSource + 'static,
     for<'a> S::Transaction<'a>: UpdateAvailabilityStorage<Types> + UpdateAggregatesStorage<Types>,
-    for<'a> S::ReadOnly<'a>:
-        AvailabilityStorage<Types> + NodeStorage<Types> + PrunedHeightStorage + AggregatesStorage,
+    for<'a> S::ReadOnly<'a>: AvailabilityStorage<Types>
+        + NodeStorage<Types>
+        + PrunedHeightStorage
+        + AggregatesStorage<Types>,
     P: AvailabilityProvider<Types>,
 {
     #[tracing::instrument(skip_all)]
@@ -1724,6 +1762,7 @@ where
     block: Notifier<BlockQueryData<Types>>,
     leaf: Notifier<LeafQueryData<Types>>,
     vid_common: Notifier<VidCommonQueryData<Types>>,
+    state_cert: Notifier<StateCertQueryDataV2<Types>>,
 }
 
 impl<Types> Default for Notifiers<Types>
@@ -1735,6 +1774,7 @@ where
             block: Notifier::new(),
             leaf: Notifier::new(),
             vid_common: Notifier::new(),
+            state_cert: Notifier::new(),
         }
     }
 }
@@ -1749,6 +1789,7 @@ impl Heights {
     async fn load<Types, T>(tx: &mut T) -> anyhow::Result<Self>
     where
         Types: NodeType,
+        Header<Types>: QueryableHeader<Types>,
         T: NodeStorage<Types> + PrunedHeightStorage + Send,
     {
         let height = tx.block_height().await.context("loading block height")? as u64;
@@ -1794,6 +1835,7 @@ where
 impl<Types, S, P> MerklizedStateHeightPersistence for FetchingDataSource<Types, S, P>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
     S: VersionedDataSource + 'static,
     for<'a> S::ReadOnly<'a>: MerklizedStateHeightStorage,
@@ -1811,6 +1853,7 @@ where
 impl<Types, S, P> NodeDataSource<Types> for FetchingDataSource<Types, S, P>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     S: VersionedDataSource + 'static,
     for<'a> S::ReadOnly<'a>: NodeStorage<Types>,
     P: Send + Sync,
@@ -1825,21 +1868,23 @@ where
     async fn count_transactions_in_range(
         &self,
         range: impl RangeBounds<usize> + Send,
+        namespace: Option<NamespaceId<Types>>,
     ) -> QueryResult<usize> {
         let mut tx = self.read().await.map_err(|err| QueryError::Error {
             message: err.to_string(),
         })?;
-        tx.count_transactions_in_range(range).await
+        tx.count_transactions_in_range(range, namespace).await
     }
 
     async fn payload_size_in_range(
         &self,
         range: impl RangeBounds<usize> + Send,
+        namespace: Option<NamespaceId<Types>>,
     ) -> QueryResult<usize> {
         let mut tx = self.read().await.map_err(|err| QueryError::Error {
             message: err.to_string(),
         })?;
-        tx.payload_size_in_range(range).await
+        tx.payload_size_in_range(range, namespace).await
     }
 
     async fn vid_share<ID>(&self, id: ID) -> QueryResult<VidShare>
@@ -1878,7 +1923,7 @@ where
     Types: NodeType,
     Payload<Types>: QueryablePayload<Types>,
     Header<Types>: QueryableHeader<Types> + explorer::traits::ExplorerHeader<Types>,
-    crate::Transaction<Types>: explorer::traits::ExplorerTransaction,
+    crate::Transaction<Types>: explorer::traits::ExplorerTransaction<Types>,
     S: VersionedDataSource + 'static,
     for<'a> S::ReadOnly<'a>: ExplorerStorage<Types>,
     P: Send + Sync,
@@ -2002,6 +2047,7 @@ trait FetchRequest: Copy + Debug + Send + Sync + 'static {
 trait Fetchable<Types>: Clone + Send + Sync + 'static
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     /// A succinct specification of the object to be fetched.
@@ -2058,6 +2104,7 @@ type PassiveFetch<T> = BoxFuture<'static, Option<T>>;
 trait RangedFetchable<Types>: Fetchable<Types, Request = Self::RangedRequest> + HeightIndexed
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     type RangedRequest: FetchRequest + From<usize> + Send;
@@ -2114,6 +2161,10 @@ impl<Types: NodeType> Storable<Types> for BlockInfo<Types> {
 
         if let Some(block) = self.block {
             block.store(storage, leaf_only).await?;
+        }
+
+        if let Some(state_cert) = self.state_cert {
+            state_cert.store(storage, leaf_only).await?;
         }
 
         Ok(())

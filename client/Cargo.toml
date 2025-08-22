@@ -6,12 +6,15 @@ edition = { workspace = true }
 publish = false
 
 [dependencies]
+alloy = { workspace = true }
 anyhow = { workspace = true }
 espresso-types = { path = "../types" }
-ethers = { workspace = true }
 futures = { workspace = true }
 jf-merkle-tree = { workspace = true }
 surf-disco = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 vbs = { workspace = true }
+
+[lints]
+workspace = true

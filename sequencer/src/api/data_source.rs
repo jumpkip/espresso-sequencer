@@ -1,30 +1,39 @@
+use std::{collections::HashMap, time::Duration};
+
+use alloy::primitives::Address;
 use anyhow::Context;
 use async_trait::async_trait;
 use committable::Commitment;
 use espresso_types::{
     config::PublicNetworkConfig,
     v0::traits::{PersistenceOptions, SequencerPersistence},
-    v0_1::{RewardAccount, RewardAccountProof, RewardAccountQueryData, RewardMerkleTree},
-    v0_99::ChainConfig,
+    v0_3::{
+        ChainConfig, RewardAccountProofV1, RewardAccountQueryDataV1, RewardAccountV1, RewardAmount,
+        RewardMerkleTreeV1, Validator,
+    },
+    v0_4::{RewardAccountProofV2, RewardAccountQueryDataV2, RewardAccountV2, RewardMerkleTreeV2},
     FeeAccount, FeeAccountProof, FeeMerkleTree, Leaf2, NodeState, PubKey, Transaction,
 };
 use futures::future::Future;
+use hotshot::types::BLSPubKey;
 use hotshot_query_service::{
-    availability::AvailabilityDataSource,
+    availability::{AvailabilityDataSource, VidCommonQueryData},
     data_source::{UpdateDataSource, VersionedDataSource},
     fetching::provider::{AnyProvider, QueryServiceProvider},
     node::NodeDataSource,
     status::StatusDataSource,
 };
 use hotshot_types::{
-    data::ViewNumber,
-    light_client::StateSignatureRequestBody,
+    data::{EpochNumber, VidShare, ViewNumber},
+    light_client::LCV3StateSignatureRequestBody,
     traits::{
         network::ConnectedNetwork,
         node_implementation::{NodeType, Versions},
     },
     PeerConfig,
 };
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use tide_disco::Url;
 
 use super::{
@@ -32,10 +41,7 @@ use super::{
     options::{Options, Query},
     sql, AccountQueryData, BlocksFrontier,
 };
-use crate::{
-    persistence::{self},
-    SeqTypes, SequencerApiVersion,
-};
+use crate::{persistence, SeqTypes, SequencerApiVersion};
 
 pub trait DataSourceOptions: PersistenceOptions {
     type DataSource: SequencerDataSource<Options = Self>;
@@ -104,11 +110,18 @@ pub(crate) trait HotShotConfigDataSource {
 
 #[async_trait]
 pub(crate) trait StateSignatureDataSource<N: ConnectedNetwork<PubKey>> {
-    async fn get_state_signature(&self, height: u64) -> Option<StateSignatureRequestBody>;
+    async fn get_state_signature(&self, height: u64) -> Option<LCV3StateSignatureRequestBody>;
 }
 
 pub(crate) trait NodeStateDataSource {
-    fn node_state(&self) -> impl Send + Future<Output = &NodeState>;
+    fn node_state(&self) -> impl Send + Future<Output = NodeState>;
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(bound = "T: NodeType")]
+pub struct StakeTableWithEpochNumber<T: NodeType> {
+    pub epoch: Option<EpochNumber>,
+    pub stake_table: Vec<PeerConfig<T>>,
 }
 
 pub(crate) trait StakeTableDataSource<T: NodeType> {
@@ -116,10 +129,32 @@ pub(crate) trait StakeTableDataSource<T: NodeType> {
     fn get_stake_table(
         &self,
         epoch: Option<<T as NodeType>::Epoch>,
-    ) -> impl Send + Future<Output = Vec<PeerConfig<T>>>;
+    ) -> impl Send + Future<Output = anyhow::Result<Vec<PeerConfig<T>>>>;
 
-    /// Get the stake table for  the current epoch if not provided
-    fn get_stake_table_current(&self) -> impl Send + Future<Output = Vec<PeerConfig<T>>>;
+    /// Get the stake table for the current epoch if not provided
+    fn get_stake_table_current(
+        &self,
+    ) -> impl Send + Future<Output = anyhow::Result<StakeTableWithEpochNumber<T>>>;
+
+    /// Get all the validators
+    fn get_validators(
+        &self,
+        epoch: <T as NodeType>::Epoch,
+    ) -> impl Send + Future<Output = anyhow::Result<IndexMap<Address, Validator<BLSPubKey>>>>;
+
+    fn get_block_reward(
+        &self,
+        epoch: Option<EpochNumber>,
+    ) -> impl Send + Future<Output = anyhow::Result<Option<RewardAmount>>>;
+    /// Get the current proposal participation.
+    fn current_proposal_participation(
+        &self,
+    ) -> impl Send + Future<Output = HashMap<BLSPubKey, f64>>;
+
+    /// Get the previous proposal participation.
+    fn previous_proposal_participation(
+        &self,
+    ) -> impl Send + Future<Output = HashMap<BLSPubKey, f64>>;
 }
 
 pub(crate) trait CatchupDataSource: Sync {
@@ -141,7 +176,7 @@ pub(crate) trait CatchupDataSource: Sync {
                 .get_accounts(instance, height, view, &[account])
                 .await?;
             let (proof, balance) = FeeAccountProof::prove(&tree, account.into()).context(
-                format!("account {account} not available for height {height}, view {view:?}"),
+                format!("account {account} not available for height {height}, view {view}"),
             )?;
             Ok(AccountQueryData { balance, proof })
         }
@@ -190,32 +225,67 @@ pub(crate) trait CatchupDataSource: Sync {
     /// `height` is provided to simplify lookups for backends where data is not indexed by view.
     /// This function is intended to be used for catchup, so `view` should be no older than the last
     /// decided view.
-    fn get_reward_account(
+    fn get_reward_account_v2(
         &self,
         instance: &NodeState,
         height: u64,
         view: ViewNumber,
-        account: RewardAccount,
-    ) -> impl Send + Future<Output = anyhow::Result<RewardAccountQueryData>> {
+        account: RewardAccountV2,
+    ) -> impl Send + Future<Output = anyhow::Result<RewardAccountQueryDataV2>> {
         async move {
             let tree = self
-                .get_reward_accounts(instance, height, view, &[account])
+                .get_reward_accounts_v2(instance, height, view, &[account])
                 .await?;
-            let (proof, balance) =
-                RewardAccountProof::prove(&tree, account.into()).context(format!(
-                    "reward account {account} not available for height {height}, view {view:?}"
-                ))?;
-            Ok(RewardAccountQueryData { balance, proof })
+            let (proof, balance) = RewardAccountProofV2::prove(&tree, account.into()).context(
+                format!("reward account {account} not available for height {height}, view {view}"),
+            )?;
+            Ok(RewardAccountQueryDataV2 { balance, proof })
         }
     }
 
-    fn get_reward_accounts(
+    fn get_reward_accounts_v2(
         &self,
         instance: &NodeState,
         height: u64,
         view: ViewNumber,
-        accounts: &[RewardAccount],
-    ) -> impl Send + Future<Output = anyhow::Result<RewardMerkleTree>>;
+        accounts: &[RewardAccountV2],
+    ) -> impl Send + Future<Output = anyhow::Result<RewardMerkleTreeV2>>;
+
+    fn get_reward_account_v1(
+        &self,
+        instance: &NodeState,
+        height: u64,
+        view: ViewNumber,
+        account: RewardAccountV1,
+    ) -> impl Send + Future<Output = anyhow::Result<RewardAccountQueryDataV1>> {
+        async move {
+            let tree = self
+                .get_reward_accounts_v1(instance, height, view, &[account])
+                .await?;
+            let (proof, balance) = RewardAccountProofV1::prove(&tree, account.into()).context(
+                format!("reward account {account} not available for height {height}, view {view}"),
+            )?;
+            Ok(RewardAccountQueryDataV1 { balance, proof })
+        }
+    }
+
+    fn get_reward_accounts_v1(
+        &self,
+        instance: &NodeState,
+        height: u64,
+        view: ViewNumber,
+        accounts: &[RewardAccountV1],
+    ) -> impl Send + Future<Output = anyhow::Result<RewardMerkleTreeV1>>;
+}
+
+#[async_trait]
+pub trait RequestResponseDataSource<Types: NodeType> {
+    async fn request_vid_shares(
+        &self,
+        block_number: u64,
+        vid_common_data: VidCommonQueryData<Types>,
+        duration: Duration,
+    ) -> anyhow::Result<Vec<VidShare>>;
 }
 
 #[cfg(any(test, feature = "testing"))]

@@ -6,21 +6,18 @@ use hotshot_query_service::availability::QueryablePayload;
 use hotshot_types::{data::VidCommitment, traits::EncodeBytes, vid::advz::advz_scheme};
 use jf_vid::VidScheme;
 use rand::RngCore;
-use sequencer_utils::test_utils::setup_test;
 
 use crate::{
-    v0_1::ADVZNsProof, v0_99::ChainConfig, BlockSize, NamespaceId, NodeState, Payload, Transaction,
+    v0_1::ADVZNsProof, v0_3::ChainConfig, BlockSize, NamespaceId, NodeState, Payload, Transaction,
     TxProof, ValidatedState,
 };
 
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn basic_correctness() {
     // play with this
     let test_cases = vec![
         vec![vec![5, 8, 8], vec![7, 9, 11], vec![10, 5, 8]], // 3 non-empty namespaces
     ];
-
-    setup_test();
     let mut rng = jf_utils::test_rng();
     let valid_tests = ValidTest::many_from_tx_lengths(test_cases, &mut rng);
 
@@ -93,7 +90,7 @@ async fn basic_correctness() {
 
             let (ns_proof_txs, ns_proof_ns_id) = ns_proof
                 .verify(block.ns_table(), &vid_commit, &vid_common)
-                .unwrap_or_else(|| panic!("namespace {} proof verification failure", ns_id));
+                .unwrap_or_else(|| panic!("namespace {ns_id} proof verification failure"));
 
             assert_eq!(ns_proof_ns_id, ns_id);
             assert_eq!(ns_proof_txs, txs);
@@ -105,9 +102,8 @@ async fn basic_correctness() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn enforce_max_block_size() {
-    setup_test();
     let test_case = vec![vec![5, 8, 8], vec![7, 9, 11], vec![10, 5, 8]];
     let payload_byte_len_expected: usize = 119;
     let ns_table_byte_len_expected: usize = 28;
@@ -117,9 +113,7 @@ async fn enforce_max_block_size() {
     let tx_count_expected = test.all_txs().len();
 
     let chain_config = ChainConfig {
-        max_block_size: BlockSize::from(
-            (payload_byte_len_expected + ns_table_byte_len_expected) as u64,
-        ),
+        max_block_size: BlockSize::from(payload_byte_len_expected as u64),
         ..Default::default()
     };
 
@@ -142,9 +136,7 @@ async fn enforce_max_block_size() {
     // WARN log should be emitted
 
     let chain_config = ChainConfig {
-        max_block_size: BlockSize::from(
-            (payload_byte_len_expected + ns_table_byte_len_expected - 1) as u64,
-        ),
+        max_block_size: BlockSize::from((payload_byte_len_expected - 1) as u64),
         ..Default::default()
     };
     let instance_state = NodeState::default().with_chain_config(chain_config);

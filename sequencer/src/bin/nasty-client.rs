@@ -28,7 +28,8 @@ use clap::Parser;
 use committable::Committable;
 use derivative::Derivative;
 use espresso_types::{
-    parse_duration, v0_99::IterableFeeInfo, BlockMerkleTree, FeeMerkleTree, Header, SeqTypes,
+    parse_duration, v0_1::IterableFeeInfo, ADVZNamespaceProofQueryData, BlockMerkleTree,
+    FeeMerkleTree, Header, SeqTypes,
 };
 use futures::{
     future::{FutureExt, TryFuture, TryFutureExt},
@@ -48,7 +49,7 @@ use jf_merkle_tree::{
     ForgetableMerkleTreeScheme, MerkleCommitment, MerkleTreeScheme, UniversalMerkleTreeScheme,
 };
 use rand::{seq::SliceRandom, RngCore};
-use sequencer::{api::endpoints::ADVZNamespaceProofQueryData, SequencerApiVersion};
+use sequencer::SequencerApiVersion;
 use sequencer_utils::logging;
 use serde::de::DeserializeOwned;
 use strum::{EnumDiscriminants, VariantArray};
@@ -666,8 +667,18 @@ impl<T: Queryable> ResourceManager<T> {
             .await
         {
             Ok(range) => {
-                ensure!(to - from <= limit, "range endpoint succeeded and returned {} results for request over limit; limit: {limit} from: {from} to: {to}", range.len());
-                ensure!(range.len() == to - from, "range endpoint returned wrong number of results; from: {from} to: {to} results: {}", range.len());
+                ensure!(
+                    to - from <= limit,
+                    "range endpoint succeeded and returned {} results for request over limit; \
+                     limit: {limit} from: {from} to: {to}",
+                    range.len()
+                );
+                ensure!(
+                    range.len() == to - from,
+                    "range endpoint returned wrong number of results; from: {from} to: {to} \
+                     results: {}",
+                    range.len()
+                );
                 for (i, obj) in range.iter().enumerate() {
                     ensure!(
                         obj.height() == from + i,
@@ -918,7 +929,8 @@ impl ResourceManager<Header> {
                 ensure!(
                     prev.height() + 1 == header.height(),
                     format!(
-                        "headers in window from {start} to {end} are not consecutive (prev = {}, curr = {})",
+                        "headers in window from {start} to {end} are not consecutive (prev = {}, \
+                         curr = {})",
                         prev.height(),
                         header.height(),
                     ),
@@ -926,7 +938,8 @@ impl ResourceManager<Header> {
                 ensure!(
                     prev.timestamp() <= header.timestamp(),
                     format!(
-                        "headers in window from {start} to {end} have decreasing timestamps (prev = {}, curr = {})",
+                        "headers in window from {start} to {end} have decreasing timestamps (prev \
+                         = {}, curr = {})",
                         prev.timestamp(),
                         header.timestamp(),
                     ),

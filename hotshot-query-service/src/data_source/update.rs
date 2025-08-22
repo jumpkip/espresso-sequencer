@@ -33,10 +33,10 @@ use jf_vid::VidScheme;
 
 use crate::{
     availability::{
-        BlockInfo, BlockQueryData, LeafQueryData, QueryablePayload, UpdateAvailabilityData,
-        VidCommonQueryData,
+        BlockInfo, BlockQueryData, LeafQueryData, QueryableHeader, QueryablePayload,
+        StateCertQueryDataV2, UpdateAvailabilityData, VidCommonQueryData,
     },
-    Payload, VidCommon,
+    Header, Payload, VidCommon,
 };
 
 /// An extension trait for types which implement the update trait for each API module.
@@ -75,6 +75,7 @@ pub trait UpdateDataSource<Types: NodeType>: UpdateAvailabilityData<Types> {
 impl<Types: NodeType, T> UpdateDataSource<Types> for T
 where
     T: UpdateAvailabilityData<Types> + Send + Sync,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     async fn update(&self, event: &Event<Types>) -> Result<(), u64> {
@@ -94,6 +95,7 @@ where
                 LeafInfo {
                     leaf: leaf2,
                     vid_share,
+                    state_cert,
                     ..
                 },
             ) in qcs.zip(leaf_chain.iter().rev())
@@ -158,7 +160,13 @@ where
                 }
 
                 if let Err(err) = self
-                    .append(BlockInfo::new(leaf_data, block_data, vid_common, vid_share))
+                    .append(BlockInfo::new(
+                        leaf_data,
+                        block_data,
+                        vid_common,
+                        vid_share,
+                        state_cert.clone().map(StateCertQueryDataV2),
+                    ))
                     .await
                 {
                     tracing::error!(height, "failed to append leaf information: {err:#}");
@@ -264,7 +272,7 @@ pub trait VersionedDataSource: Send + Sync {
 /// underlying storage, and are saved if the process restarts. It also allows pending changes to be
 /// rolled back ([revert](Self::revert)) so that they are never written back to storage and are no
 /// longer reflected even through the data source object which was used to make the changes.
-pub trait Transaction: Send + Sync {
+pub trait Transaction: Send + Sync + Sized {
     fn commit(self) -> impl Future<Output = anyhow::Result<()>> + Send;
     fn revert(self) -> impl Future + Send;
 }

@@ -29,11 +29,13 @@ use committable::Committable;
 use futures::future::Future;
 use hotshot_types::{
     data::{VidCommitment, VidShare},
-    traits::{block_contents::BlockHeader, node_implementation::NodeType},
+    traits::{
+        block_contents::BlockHeader,
+        node_implementation::{ConsensusTime, NodeType},
+    },
 };
 use serde::{de::DeserializeOwned, Serialize};
 use snafu::OptionExt;
-use vec1::Vec1;
 
 use super::{
     ledger_log::{Iter, LedgerLog},
@@ -47,25 +49,28 @@ use crate::{
         data_source::{BlockId, LeafId},
         query_data::{
             BlockHash, BlockQueryData, LeafHash, LeafQueryData, PayloadQueryData, QueryableHeader,
-            QueryablePayload, TransactionHash, TransactionQueryData, VidCommonQueryData,
+            QueryablePayload, TransactionHash, VidCommonQueryData,
         },
+        NamespaceId, StateCertQueryDataV2,
     },
     data_source::{update, VersionedDataSource},
     metrics::PrometheusMetrics,
     node::{SyncStatus, TimeWindowQueryData, WindowStart},
     status::HasMetrics,
     types::HeightIndexed,
-    ErrorSnafu, Header, MissingSnafu, NotFoundSnafu, Payload, QueryError, QueryResult,
+    Header, MissingSnafu, NotFoundSnafu, Payload, QueryError, QueryResult,
 };
 
 const CACHED_LEAVES_COUNT: usize = 100;
 const CACHED_BLOCKS_COUNT: usize = 100;
 const CACHED_VID_COMMON_COUNT: usize = 100;
+const CACHED_STATE_CERT_COUNT: usize = 5;
 
 #[derive(custom_debug::Debug)]
 pub struct FileSystemStorageInner<Types>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     index_by_leaf_hash: HashMap<LeafHash<Types>, u64>,
@@ -80,11 +85,13 @@ where
     leaf_storage: LedgerLog<LeafQueryData<Types>>,
     block_storage: LedgerLog<BlockQueryData<Types>>,
     vid_storage: LedgerLog<(VidCommonQueryData<Types>, Option<VidShare>)>,
+    state_cert_storage: LedgerLog<StateCertQueryDataV2<Types>>,
 }
 
 impl<Types> FileSystemStorageInner<Types>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     fn get_block_index(&self, id: BlockId<Types>) -> QueryResult<usize> {
@@ -123,18 +130,22 @@ where
 #[derive(Debug)]
 pub struct FileSystemStorage<Types: NodeType>
 where
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     inner: RwLock<FileSystemStorageInner<Types>>,
     metrics: PrometheusMetrics,
 }
 
-impl<Types: NodeType> PrunerConfig for FileSystemStorage<Types> where
-    Payload<Types>: QueryablePayload<Types>
+impl<Types: NodeType> PrunerConfig for FileSystemStorage<Types>
+where
+    Header<Types>: QueryableHeader<Types>,
+    Payload<Types>: QueryablePayload<Types>,
 {
 }
 impl<Types: NodeType> PruneStorage for FileSystemStorage<Types>
 where
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     type Pruner = ();
@@ -143,9 +154,10 @@ where
 #[async_trait]
 impl<Types: NodeType> MigrateTypes<Types> for FileSystemStorage<Types>
 where
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
-    async fn migrate_types(&self) -> anyhow::Result<()> {
+    async fn migrate_types(&self, _batch_size: u64) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -205,6 +217,11 @@ where
                 leaf_storage: LedgerLog::create(loader, "leaves", CACHED_LEAVES_COUNT)?,
                 block_storage: LedgerLog::create(loader, "blocks", CACHED_BLOCKS_COUNT)?,
                 vid_storage: LedgerLog::create(loader, "vid_common", CACHED_VID_COMMON_COUNT)?,
+                state_cert_storage: LedgerLog::create(
+                    loader,
+                    "state_cert",
+                    CACHED_STATE_CERT_COUNT,
+                )?,
             }),
             metrics: Default::default(),
         })
@@ -227,6 +244,11 @@ where
             loader,
             "vid_common",
             CACHED_VID_COMMON_COUNT,
+        )?;
+        let state_cert_storage = LedgerLog::<StateCertQueryDataV2<Types>>::open(
+            loader,
+            "state_cert",
+            CACHED_STATE_CERT_COUNT,
         )?;
 
         let mut index_by_block_hash = HashMap::new();
@@ -275,6 +297,7 @@ where
                 leaf_storage,
                 block_storage,
                 vid_storage,
+                state_cert_storage,
                 top_storage: None,
             }),
             metrics: Default::default(),
@@ -287,10 +310,44 @@ where
         inner.leaf_storage.skip_version()?;
         inner.block_storage.skip_version()?;
         inner.vid_storage.skip_version()?;
+        inner.state_cert_storage.skip_version()?;
         if let Some(store) = &mut inner.top_storage {
             store.commit_version()?;
         }
         Ok(())
+    }
+
+    /// Get the stored VID share for a given block, if one exists.
+    pub async fn get_vid_share(&self, block_id: BlockId<Types>) -> QueryResult<VidShare> {
+        let mut tx = self.read().await.map_err(|err| QueryError::Error {
+            message: err.to_string(),
+        })?;
+        let share = tx.vid_share(block_id).await?;
+        Ok(share)
+    }
+
+    /// Get the stored VID common data for a given block, if one exists.
+    pub async fn get_vid_common(
+        &self,
+        block_id: BlockId<Types>,
+    ) -> QueryResult<VidCommonQueryData<Types>> {
+        let mut tx = self.read().await.map_err(|err| QueryError::Error {
+            message: err.to_string(),
+        })?;
+        let share = tx.get_vid_common(block_id).await?;
+        Ok(share)
+    }
+
+    /// Get the stored VID common metadata for a given block, if one exists.
+    pub async fn get_vid_common_metadata(
+        &self,
+        block_id: BlockId<Types>,
+    ) -> QueryResult<VidCommonMetadata<Types>> {
+        let mut tx = self.read().await.map_err(|err| QueryError::Error {
+            message: err.to_string(),
+        })?;
+        let share = tx.get_vid_common_metadata(block_id).await?;
+        Ok(share)
     }
 }
 
@@ -301,18 +358,21 @@ pub trait Revert {
 impl<Types> Revert for RwLockWriteGuard<'_, FileSystemStorageInner<Types>>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     fn revert(&mut self) {
         self.leaf_storage.revert_version().unwrap();
         self.block_storage.revert_version().unwrap();
         self.vid_storage.revert_version().unwrap();
+        self.state_cert_storage.revert_version().unwrap();
     }
 }
 
 impl<Types> Revert for RwLockReadGuard<'_, FileSystemStorageInner<Types>>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     fn revert(&mut self) {
@@ -333,12 +393,14 @@ impl<T: Revert> Drop for Transaction<T> {
 impl<Types> update::Transaction for Transaction<RwLockWriteGuard<'_, FileSystemStorageInner<Types>>>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     async fn commit(mut self) -> anyhow::Result<()> {
         self.inner.leaf_storage.commit_version().await?;
         self.inner.block_storage.commit_version().await?;
         self.inner.vid_storage.commit_version().await?;
+        self.inner.state_cert_storage.commit_version().await?;
         if let Some(store) = &mut self.inner.top_storage {
             store.commit_version()?;
         }
@@ -354,6 +416,7 @@ where
 impl<Types> update::Transaction for Transaction<RwLockReadGuard<'_, FileSystemStorageInner<Types>>>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     async fn commit(self) -> anyhow::Result<()> {
@@ -369,6 +432,7 @@ where
 
 impl<Types: NodeType> VersionedDataSource for FileSystemStorage<Types>
 where
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     type Transaction<'a>
@@ -456,12 +520,6 @@ where
             .nth(n)
             .context(NotFoundSnafu)?
             .context(MissingSnafu)
-    }
-
-    async fn get_leaves(&mut self, _height: u64) -> QueryResult<Vec1<LeafQueryData<Types>>> {
-        return Err(QueryError::Error {
-            message: "get_leaves is not supported with file system backend".into(),
-        });
     }
 
     async fn get_block(&mut self, id: BlockId<Types>) -> QueryResult<BlockQueryData<Types>> {
@@ -572,21 +630,16 @@ where
             .collect())
     }
 
-    async fn get_transaction(
+    async fn get_block_with_transaction(
         &mut self,
         hash: TransactionHash<Types>,
-    ) -> QueryResult<TransactionQueryData<Types>> {
+    ) -> QueryResult<BlockQueryData<Types>> {
         let height = self
             .inner
             .index_by_txn_hash
             .get(&hash)
             .context(NotFoundSnafu)?;
-        let block = self.inner.get_block((*height as usize).into())?;
-        TransactionQueryData::with_hash(&block, hash).context(ErrorSnafu {
-            message: format!(
-                "transaction index inconsistent: block {height} contains no transaction {hash}"
-            ),
-        })
+        self.inner.get_block((*height as usize).into())
     }
 
     async fn first_available_leaf(&mut self, from: u64) -> QueryResult<LeafQueryData<Types>> {
@@ -594,6 +647,15 @@ where
         // efficiently seek to the first leaf with height >= `from`. Our best effort is to return
         // `from` itself if we can, or fail.
         self.get_leaf((from as usize).into()).await
+    }
+
+    async fn get_state_cert(&mut self, epoch: u64) -> QueryResult<StateCertQueryDataV2<Types>> {
+        self.inner
+            .state_cert_storage
+            .iter()
+            .nth(epoch as usize)
+            .context(NotFoundSnafu)?
+            .context(MissingSnafu)
     }
 }
 
@@ -659,6 +721,16 @@ where
             .insert(common.height() as usize, (common, share))?;
         Ok(())
     }
+
+    async fn insert_state_cert(
+        &mut self,
+        state_cert: StateCertQueryDataV2<Types>,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .state_cert_storage
+            .insert(state_cert.0.epoch.u64() as usize, state_cert)?;
+        Ok(())
+    }
 }
 
 /// Update an index mapping hashes of objects to their positions in the ledger.
@@ -694,6 +766,7 @@ where
     async fn count_transactions_in_range(
         &mut self,
         range: impl RangeBounds<usize> + Send,
+        namespace: Option<NamespaceId<Types>>,
     ) -> QueryResult<usize> {
         if !matches!(range.start_bound(), Bound::Unbounded | Bound::Included(0))
             || !matches!(range.end_bound(), Bound::Unbounded)
@@ -703,18 +776,31 @@ where
             });
         }
 
+        if namespace.is_some() {
+            return Err(QueryError::Error {
+                message: "file system does not support per-namespace stats".into(),
+            });
+        }
+
         Ok(self.inner.num_transactions)
     }
 
     async fn payload_size_in_range(
         &mut self,
         range: impl RangeBounds<usize> + Send,
+        namespace: Option<NamespaceId<Types>>,
     ) -> QueryResult<usize> {
         if !matches!(range.start_bound(), Bound::Unbounded | Bound::Included(0))
             || !matches!(range.end_bound(), Bound::Unbounded)
         {
             return Err(QueryError::Error {
                 message: "partial aggregates are not supported with file system backend".into(),
+            });
+        }
+
+        if namespace.is_some() {
+            return Err(QueryError::Error {
+                message: "file system does not support per-namespace stats".into(),
             });
         }
 
@@ -810,12 +896,16 @@ where
     }
 }
 
-impl<T: Revert + Send> AggregatesStorage for Transaction<T> {
+impl<Types, T: Revert + Send> AggregatesStorage<Types> for Transaction<T>
+where
+    Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
+{
     async fn aggregates_height(&mut self) -> anyhow::Result<usize> {
         Ok(0)
     }
 
-    async fn load_prev_aggregate(&mut self) -> anyhow::Result<Option<Aggregate>> {
+    async fn load_prev_aggregate(&mut self) -> anyhow::Result<Option<Aggregate<Types>>> {
         Ok(None)
     }
 }
@@ -823,12 +913,13 @@ impl<T: Revert + Send> AggregatesStorage for Transaction<T> {
 impl<Types, T: Revert + Send> UpdateAggregatesStorage<Types> for Transaction<T>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
 {
     async fn update_aggregates(
         &mut self,
-        _prev: Aggregate,
+        _prev: Aggregate<Types>,
         _blocks: &[PayloadMetadata<Types>],
-    ) -> anyhow::Result<Aggregate> {
+    ) -> anyhow::Result<Aggregate<Types>> {
         Ok(Aggregate::default())
     }
 }
@@ -838,6 +929,7 @@ impl<T: Revert> PrunedHeightStorage for Transaction<T> {}
 impl<Types> HasMetrics for FileSystemStorage<Types>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     fn metrics(&self) -> &PrometheusMetrics {

@@ -1,13 +1,9 @@
-use std::sync::Arc;
-
+use anyhow::Context;
 use clap::Parser;
+use espresso_types::traits::SequencerPersistence;
 #[allow(unused_imports)]
-use espresso_types::{
-    traits::NullEventConsumer, FeeVersion, MarketplaceVersion, SequencerVersions,
-    SolverAuctionResultsProvider, V0_0,
-};
+use espresso_types::{traits::NullEventConsumer, FeeVersion, SequencerVersions, V0_0};
 use futures::future::FutureExt;
-use hotshot::MarketplaceConfig;
 use hotshot_types::traits::{metrics::NoMetrics, node_implementation::Versions};
 use vbs::version::StaticVersionType;
 
@@ -27,39 +23,86 @@ pub async fn main() -> anyhow::Result<()> {
     tracing::warn!(?modules, "sequencer starting up");
 
     let genesis = Genesis::from_file(&opt.genesis_file)?;
-    tracing::info!(?genesis, "genesis");
+    tracing::warn!(?genesis, "genesis");
 
     let base = genesis.base_version;
     let upgrade = genesis.upgrade_version;
 
     match (base, upgrade) {
-        #[cfg(all(feature = "fee", feature = "marketplace"))]
-        (FeeVersion::VERSION, MarketplaceVersion::VERSION) => {
+        #[cfg(all(feature = "pos", feature = "drb-and-header"))]
+        (
+            espresso_types::EpochVersion::VERSION,
+            espresso_types::DrbAndHeaderUpgradeVersion::VERSION,
+        ) => {
             run(
                 genesis,
                 modules,
                 opt,
-                SequencerVersions::<FeeVersion, MarketplaceVersion>::new(),
+                SequencerVersions::<
+                    espresso_types::EpochVersion,
+                    espresso_types::DrbAndHeaderUpgradeVersion,
+                >::new(),
+            )
+            .await
+        },
+        #[cfg(all(feature = "fee", feature = "drb-and-header"))]
+        (
+            espresso_types::FeeVersion::VERSION,
+            espresso_types::DrbAndHeaderUpgradeVersion::VERSION,
+        ) => {
+            run(
+                genesis,
+                modules,
+                opt,
+                SequencerVersions::<
+                    espresso_types::FeeVersion,
+                    espresso_types::DrbAndHeaderUpgradeVersion,
+                >::new(),
+            )
+            .await
+        },
+        #[cfg(feature = "drb-and-header")]
+        (espresso_types::DrbAndHeaderUpgradeVersion::VERSION, _) => {
+            run(
+                genesis,
+                modules,
+                opt,
+                SequencerVersions::<
+                    espresso_types::DrbAndHeaderUpgradeVersion,
+                    espresso_types::DrbAndHeaderUpgradeVersion,
+                >::new(),
+            )
+            .await
+        },
+        #[cfg(all(feature = "fee", feature = "pos"))]
+        (FeeVersion::VERSION, espresso_types::EpochVersion::VERSION) => {
+            run(
+                genesis,
+                modules,
+                opt,
+                SequencerVersions::<espresso_types::FeeVersion, espresso_types::EpochVersion>::new(
+                ),
+            )
+            .await
+        },
+        #[cfg(feature = "pos")]
+        (espresso_types::EpochVersion::VERSION, espresso_types::EpochVersion::VERSION) => {
+            run(
+                genesis,
+                modules,
+                opt,
+                // Specifying V0_0 disables upgrades
+                SequencerVersions::<espresso_types::EpochVersion, espresso_types::EpochVersion>::new(),
             )
             .await
         },
         #[cfg(feature = "fee")]
-        (FeeVersion::VERSION, _) => {
+        (FeeVersion::VERSION, espresso_types::FeeVersion::VERSION) => {
             run(
                 genesis,
                 modules,
                 opt,
-                SequencerVersions::<FeeVersion, V0_0>::new(),
-            )
-            .await
-        },
-        #[cfg(feature = "marketplace")]
-        (MarketplaceVersion::VERSION, _) => {
-            run(
-                genesis,
-                modules,
-                opt,
-                SequencerVersions::<MarketplaceVersion, V0_0>::new(),
+                SequencerVersions::<FeeVersion, espresso_types::FeeVersion>::new(),
             )
             .await
         },
@@ -168,17 +211,13 @@ where
         libp2p_gossip_lazy: opt.libp2p_gossip_lazy,
     };
 
-    let marketplace_config = MarketplaceConfig {
-        auction_results_provider: Arc::new(SolverAuctionResultsProvider {
-            url: opt.auction_results_solver_url,
-            marketplace_path: opt.marketplace_solver_path,
-            results_path: opt.auction_results_path,
-        }),
-        fallback_builder_url: opt.fallback_builder_url,
-    };
     let proposal_fetcher_config = opt.proposal_fetcher_config;
 
     let persistence = storage_opt.create().await?;
+    persistence
+        .migrate_consensus()
+        .await
+        .context("failed to migrate consensus data")?;
 
     // Initialize HotShot. If the user requested the HTTP module, we must initialize the handle in
     // a special way, in order to populate the API with consensus metrics. Otherwise, we initialize
@@ -211,7 +250,7 @@ where
             }
 
             http_opt
-                .serve(move |metrics, consumer| {
+                .serve(move |metrics, consumer, storage| {
                     async move {
                         init_node(
                             genesis,
@@ -219,11 +258,11 @@ where
                             &*metrics,
                             persistence,
                             l1_params,
+                            storage,
                             versions,
                             consumer,
                             opt.is_da,
                             opt.identity,
-                            marketplace_config,
                             proposal_fetcher_config,
                         )
                         .await
@@ -239,11 +278,11 @@ where
                 &NoMetrics,
                 persistence,
                 l1_params,
+                None,
                 versions,
                 NullEventConsumer,
                 opt.is_da,
                 opt.identity,
-                marketplace_config,
                 proposal_fetcher_config,
             )
             .await?
@@ -260,7 +299,6 @@ mod test {
     use espresso_types::{MockSequencerVersions, PubKey};
     use hotshot_types::{light_client::StateKeyPair, traits::signature_key::SignatureKey};
     use portpicker::pick_unused_port;
-    use sequencer_utils::test_utils::setup_test;
     use surf_disco::{error::ClientError, Client, Url};
     use tempfile::TempDir;
     use tokio::spawn;
@@ -274,10 +312,8 @@ mod test {
         SequencerApiVersion,
     };
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_startup_before_orchestrator() {
-        setup_test();
-
         let (pub_key, priv_key) = PubKey::generated_from_seed_indexed([0; 32], 0);
         let state_key = StateKeyPair::generate_from_seed_indexed([0; 32], 0);
 
@@ -295,6 +331,11 @@ mod test {
             base_version: Version { major: 0, minor: 1 },
             upgrade_version: Version { major: 0, minor: 2 },
             epoch_height: None,
+            drb_difficulty: None,
+            drb_upgrade_difficulty: None,
+            epoch_start_block: None,
+            stake_table_capacity: None,
+            genesis_version: Version { major: 0, minor: 1 },
         };
         genesis.to_file(&genesis_file).unwrap();
 

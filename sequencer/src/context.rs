@@ -1,5 +1,6 @@
 use std::{
     fmt::{Debug, Display},
+    marker::PhantomData,
     sync::Arc,
     time::Duration,
 };
@@ -17,7 +18,7 @@ use futures::{
 };
 use hotshot::{
     types::{Event, EventType, SystemContextHandle},
-    MarketplaceConfig, SystemContext,
+    SystemContext,
 };
 use hotshot_events_service::events_source::{EventConsumer, EventsStreamer};
 use hotshot_orchestrator::client::OrchestratorClient;
@@ -26,28 +27,28 @@ use hotshot_types::{
     data::{Leaf2, ViewNumber},
     epoch_membership::EpochMembershipCoordinator,
     network::NetworkConfig,
+    storage_metrics::StorageMetricsValue,
     traits::{metrics::Metrics, network::ConnectedNetwork, node_implementation::Versions},
     PeerConfig, ValidatorConfig,
 };
 use parking_lot::Mutex;
-use request_response::{network::Bytes, RequestResponse, RequestResponseConfig};
-use tokio::{
-    spawn,
-    sync::mpsc::{channel, Receiver},
-    task::JoinHandle,
-};
+use request_response::RequestResponseConfig;
+use tokio::{spawn, sync::mpsc::channel, task::JoinHandle};
 use tracing::{Instrument, Level};
 use url::Url;
 
 use crate::{
+    catchup::ParallelStateCatchup,
     external_event_handler::ExternalEventHandler,
     proposal_fetcher::ProposalFetcherConfig,
     request_response::{
-        data_source::DataSource, network::Sender as RequestResponseSender,
-        recipient_source::RecipientSource, request::Request,
+        data_source::{DataSource, Storage as RequestResponseStorage},
+        network::Sender as RequestResponseSender,
+        recipient_source::RecipientSource,
+        RequestResponseProtocol,
     },
     state_signature::StateSigner,
-    static_stake_table_commitment, Node, SeqTypes, SequencerApiVersion,
+    Node, SeqTypes, SequencerApiVersion,
 };
 
 /// The consensus handle
@@ -64,17 +65,10 @@ pub struct SequencerContext<N: ConnectedNetwork<PubKey>, P: SequencerPersistence
     /// The request-response protocol
     #[derivative(Debug = "ignore")]
     #[allow(dead_code)]
-    request_response_protocol: RequestResponse<
-        RequestResponseSender,
-        Receiver<Bytes>,
-        Request,
-        RecipientSource,
-        DataSource,
-        PubKey,
-    >,
+    pub request_response_protocol: RequestResponseProtocol<Node<N, P>, V, N, P>,
 
     /// Context for generating state signatures.
-    state_signer: Arc<StateSigner<SequencerApiVersion>>,
+    state_signer: Arc<RwLock<StateSigner<SequencerApiVersion>>>,
 
     /// An orchestrator to wait for before starting consensus.
     #[derivative(Debug = "ignore")]
@@ -104,14 +98,15 @@ impl<N: ConnectedNetwork<PubKey>, P: SequencerPersistence, V: Versions> Sequence
         validator_config: ValidatorConfig<SeqTypes>,
         coordinator: EpochMembershipCoordinator<SeqTypes>,
         instance_state: NodeState,
-        persistence: P,
+        storage: Option<RequestResponseStorage>,
+        state_catchup: ParallelStateCatchup,
+        persistence: Arc<P>,
         network: Arc<N>,
         state_relay_server: Option<Url>,
         metrics: &dyn Metrics,
-        stake_table_capacity: u64,
+        stake_table_capacity: usize,
         event_consumer: impl PersistenceEventConsumer + 'static,
         _: V,
-        marketplace_config: MarketplaceConfig<SeqTypes, Node<N, P>>,
         proposal_fetcher_cfg: ProposalFetcherConfig,
     ) -> anyhow::Result<Self> {
         let config = &network_config.config;
@@ -131,20 +126,14 @@ impl<N: ConnectedNetwork<PubKey>, P: SequencerPersistence, V: Versions> Sequence
             .load_consensus_state::<V>(instance_state.clone())
             .await?;
 
-        let stake_table_commit = static_stake_table_commitment(
-            &config.known_nodes_with_stake,
-            stake_table_capacity
-                .try_into()
-                .context("stake table capacity out of range")?,
-        );
+        let stake_table = config.hotshot_stake_table();
+        let stake_table_commit = stake_table.commitment(stake_table_capacity)?;
+        let stake_table_epoch = None;
 
         let event_streamer = Arc::new(RwLock::new(EventsStreamer::<SeqTypes>::new(
-            config.known_nodes_with_stake.clone(),
+            stake_table.0,
             0,
         )));
-
-        let persistence = Arc::new(persistence);
-        let membership = coordinator.membership().clone();
 
         let handle = SystemContext::init(
             validator_config.public_key,
@@ -152,12 +141,12 @@ impl<N: ConnectedNetwork<PubKey>, P: SequencerPersistence, V: Versions> Sequence
             validator_config.state_private_key.clone(),
             instance_state.node_id,
             config.clone(),
-            coordinator,
+            coordinator.clone(),
             network.clone(),
             initializer,
             ConsensusMetricsValue::new(metrics),
-            persistence.clone(),
-            marketplace_config,
+            Arc::clone(&persistence),
+            StorageMetricsValue::new(metrics),
         )
         .await?
         .0;
@@ -166,36 +155,53 @@ impl<N: ConnectedNetwork<PubKey>, P: SequencerPersistence, V: Versions> Sequence
             validator_config.state_private_key.clone(),
             validator_config.state_public_key.clone(),
             stake_table_commit,
+            stake_table_epoch,
+            stake_table_capacity,
         );
         if let Some(url) = state_relay_server {
             state_signer = state_signer.with_relay_server(url);
         }
 
         // Create the channel for sending outbound messages from the external event handler
-        let (outbound_message_sender, outbound_message_receiver) = channel(10);
-        let (request_response_sender, request_response_receiver) = channel(10);
+        let (outbound_message_sender, outbound_message_receiver) = channel(20);
+        let (request_response_sender, request_response_receiver) = channel(20);
 
         // Configure the request-response protocol
         let request_response_config = RequestResponseConfig {
             incoming_request_ttl: Duration::from_secs(40),
-            response_send_timeout: Duration::from_secs(5),
-            request_batch_size: 10,
-            request_batch_interval: Duration::from_secs(3),
-            max_outgoing_responses: 10,
-            response_validate_timeout: Duration::from_secs(1),
-            max_incoming_responses: 5,
+            incoming_request_timeout: Duration::from_secs(5),
+            incoming_response_timeout: Duration::from_secs(5),
+            request_batch_size: 5,
+            request_batch_interval: Duration::from_secs(2),
+            max_incoming_requests: 10,
+            max_incoming_requests_per_key: 1,
+            max_incoming_responses: 20,
         };
 
         // Create the request-response protocol
-        let request_response_protocol = RequestResponse::new(
+        let request_response_protocol = RequestResponseProtocol::new(
             request_response_config,
             RequestResponseSender::new(outbound_message_sender),
             request_response_receiver,
             RecipientSource {
-                memberships: membership,
+                memberships: coordinator,
+                consensus: handle.hotshot.clone(),
+                public_key: validator_config.public_key,
             },
-            DataSource {},
+            DataSource {
+                node_state: instance_state.clone(),
+                storage,
+                consensus: handle.hotshot.clone(),
+                phantom: PhantomData,
+            },
+            validator_config.public_key,
+            validator_config.private_key.clone(),
         );
+
+        // Add the request-response protocol to the list of providers for state catchup. Since the interior is mutable,
+        // the request-response protocol will now retroactively be used anywhere we passed in the original struct (e.g. in consensus
+        // itself)
+        state_catchup.add_provider(Arc::new(request_response_protocol.clone()));
 
         // Create the external event handler
         let mut tasks = TaskList::default();
@@ -205,7 +211,6 @@ impl<N: ConnectedNetwork<PubKey>, P: SequencerPersistence, V: Versions> Sequence
             outbound_message_receiver,
             network,
             pub_key,
-            handle.hotshot.upgrade_lock.clone(),
         )
         .await
         .with_context(|| "Failed to create external event handler")?;
@@ -235,14 +240,7 @@ impl<N: ConnectedNetwork<PubKey>, P: SequencerPersistence, V: Versions> Sequence
         persistence: Arc<P>,
         state_signer: StateSigner<SequencerApiVersion>,
         external_event_handler: ExternalEventHandler<V>,
-        request_response_protocol: RequestResponse<
-            RequestResponseSender,
-            Receiver<Bytes>,
-            Request,
-            RecipientSource,
-            DataSource,
-            PubKey,
-        >,
+        request_response_protocol: RequestResponseProtocol<Node<N, P>, V, N, P>,
         event_streamer: Arc<RwLock<EventsStreamer<SeqTypes>>>,
         node_state: NodeState,
         network_config: NetworkConfig<SeqTypes>,
@@ -257,7 +255,7 @@ impl<N: ConnectedNetwork<PubKey>, P: SequencerPersistence, V: Versions> Sequence
         let node_id = node_state.node_id;
         let mut ctx = Self {
             handle: Arc::new(RwLock::new(handle)),
-            state_signer: Arc::new(state_signer),
+            state_signer: Arc::new(RwLock::new(state_signer)),
             request_response_protocol,
             tasks: Default::default(),
             detached: false,
@@ -280,6 +278,7 @@ impl<N: ConnectedNetwork<PubKey>, P: SequencerPersistence, V: Versions> Sequence
         ctx.spawn(
             "event handler",
             handle_events(
+                ctx.handle.clone(),
                 node_id,
                 events,
                 persistence,
@@ -307,7 +306,7 @@ impl<N: ConnectedNetwork<PubKey>, P: SequencerPersistence, V: Versions> Sequence
     }
 
     /// Return a reference to the consensus state signer.
-    pub fn state_signer(&self) -> Arc<StateSigner<SequencerApiVersion>> {
+    pub fn state_signer(&self) -> Arc<RwLock<StateSigner<SequencerApiVersion>>> {
         self.state_signer.clone()
     }
 
@@ -450,16 +449,21 @@ impl<N: ConnectedNetwork<PubKey>, P: SequencerPersistence, V: Versions> Drop
 
 #[tracing::instrument(skip_all, fields(node_id))]
 #[allow(clippy::too_many_arguments)]
-async fn handle_events<V: Versions>(
+async fn handle_events<N, P, V>(
+    consensus: Arc<RwLock<Consensus<N, P, V>>>,
     node_id: u64,
     mut events: impl Stream<Item = Event<SeqTypes>> + Unpin,
-    persistence: Arc<impl SequencerPersistence>,
-    state_signer: Arc<StateSigner<SequencerApiVersion>>,
+    persistence: Arc<P>,
+    state_signer: Arc<RwLock<StateSigner<SequencerApiVersion>>>,
     external_event_handler: ExternalEventHandler<V>,
     events_streamer: Option<Arc<RwLock<EventsStreamer<SeqTypes>>>>,
     event_consumer: impl PersistenceEventConsumer + 'static,
     anchor_view: Option<ViewNumber>,
-) {
+) where
+    N: ConnectedNetwork<PubKey>,
+    P: SequencerPersistence,
+    V: Versions,
+{
     if let Some(view) = anchor_view {
         // Process and clean up any leaves that we may have persisted last time we were running but
         // failed to handle due to a shutdown.
@@ -475,12 +479,15 @@ async fn handle_events<V: Versions>(
 
     while let Some(event) = events.next().await {
         tracing::debug!(node_id, ?event, "consensus event");
-
         // Store latest consensus state.
         persistence.handle_event(&event, &event_consumer).await;
 
         // Generate state signature.
-        state_signer.handle_event(&event).await;
+        state_signer
+            .write()
+            .await
+            .handle_event(&event, consensus.clone())
+            .await;
 
         // Handle external messages
         if let EventType::ExternalMessageReceived { data, .. } = &event.event {

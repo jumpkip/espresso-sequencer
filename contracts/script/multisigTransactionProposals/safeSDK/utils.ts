@@ -62,15 +62,16 @@ export function createSafeTransactionData(to: string, data: string, value: strin
  * @param {string} address - The Ethereum address to validate
  * @throws {Error} - Throws an error if the address is invalid and doesn't follow Ethereum address standards
  */
-export function getSigner(web3Provider: ethers.Provider): ethers.Signer {
+export function getSigner(web3Provider: ethers.Provider, useHardwareWallet: boolean): ethers.Signer {
   let orchestratorSigner;
-  const use_hardware_wallet = getEnvVar("USE_HARDWARE_WALLET");
-  if (use_hardware_wallet == "true") {
+  if (useHardwareWallet == true) {
     // Create a signer using the ledger
     orchestratorSigner = new LedgerSigner(HIDTransport, web3Provider);
   } else {
     // Create a signer using the orchestrator's private key and the web3 provider
-    orchestratorSigner = new ethers.Wallet(getEnvVar("SAFE_ORCHESTRATOR_PRIVATE_KEY"), web3Provider);
+    // orchestratorSigner = new ethers.Wallet(getEnvVar("SAFE_ORCHESTRATOR_PRIVATE_KEY"), web3Provider);
+    //get orchestrator signer from mnemonic
+    orchestratorSigner = ethers.Wallet.fromPhrase(getEnvVar("ESPRESSO_SEQUENCER_ETH_MNEMONIC"), web3Provider);
   }
 
   return orchestratorSigner;
@@ -90,10 +91,11 @@ export async function createSafeTransaction(
   contractAddress: string,
   data: string,
   value: string,
+  useHardwareWallet: boolean,
 ): Promise<LocalSafeTransaction> {
   // Prepare the safe transaction data with the contract address, data, and value
   let safeTransactionData = createSafeTransactionData(contractAddress, data, value);
-  if (getEnvVar("USE_HARDWARE_WALLET")) {
+  if (useHardwareWallet == true) {
     console.log(`Please sign the message on your connected Ledger device`);
   }
 
@@ -117,11 +119,12 @@ export async function createAndSignSafeTransaction(
   safeSDK: Safe,
   contractAddress: string,
   data: string,
+  useHardwareWallet: boolean,
 ): Promise<{ safeTransaction: LocalSafeTransaction; safeTxHash: string; senderSignature: SafeSignature }> {
   validateEthereumAddress(contractAddress);
 
   // Create the Safe Transaction Object
-  const safeTransaction = await createSafeTransaction(safeSDK, contractAddress, data, "0");
+  const safeTransaction = await createSafeTransaction(safeSDK, contractAddress, data, "0", useHardwareWallet);
 
   // Get the transaction hash
   const safeTxHash = await safeSDK.getTransactionHash(safeTransaction);
@@ -130,4 +133,29 @@ export async function createAndSignSafeTransaction(
   const senderSignature = await safeSDK.signHash(safeTxHash);
 
   return { safeTransaction, safeTxHash, senderSignature };
+}
+
+export async function decodeProposalData() {
+  try {
+    let contractName = process.argv[2];
+    const encodedData = process.argv[3];
+
+    if (!contractName || !encodedData) {
+      throw new Error("Contract name and encoded data are required");
+    }
+
+    contractName = contractName.replace(".sol", "");
+
+    const contractAbi = require(`../../../out/${contractName}.sol/${contractName}.json`).abi;
+
+    const contractInterface = new ethers.Interface(contractAbi);
+
+    const decodedData = contractInterface.parseTransaction({ data: encodedData });
+
+    console.log("Function Name:", decodedData?.name);
+    console.log("Arguments:", decodedData?.args);
+  } catch (error: any) {
+    console.error("Error Message:", error.shortMessage);
+    console.error("Ensure the contract name is correct and the encoded data is valid e.g. it must start with 0x");
+  }
 }

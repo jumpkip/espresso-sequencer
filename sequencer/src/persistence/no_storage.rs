@@ -1,32 +1,33 @@
 //! Mock implementation of persistence, for testing.
-#![cfg(any(test, feature = "testing"))]
-
 use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::bail;
 use async_trait::async_trait;
 use espresso_types::{
-    traits::MembershipPersistence,
+    traits::{EventsPersistenceRead, MembershipPersistence},
     v0::traits::{EventConsumer, PersistenceOptions, SequencerPersistence},
-    v0_3::{IndexedStake, Validator},
-    Leaf2, NetworkConfig,
+    v0_3::{EventKey, IndexedStake, RewardAmount, StakeTableEvent},
+    Leaf2, NetworkConfig, ValidatorMap,
 };
-use hotshot::{types::BLSPubKey, InitializerEpochInfo};
+use hotshot::InitializerEpochInfo;
+use hotshot_libp2p_networking::network::behaviours::dht::store::persistent::{
+    DhtPersistentStorage, SerializableRecord,
+};
 use hotshot_types::{
     data::{
         vid_disperse::{ADVZDisperseShare, VidDisperseShare2},
         DaProposal, DaProposal2, EpochNumber, QuorumProposalWrapper, VidCommitment,
         VidDisperseShare,
     },
-    drb::DrbResult,
+    drb::{DrbInput, DrbResult},
     event::{Event, EventType, HotShotAction, LeafInfo},
     message::Proposal,
     simple_certificate::{
-        LightClientStateUpdateCertificate, NextEpochQuorumCertificate2, QuorumCertificate2,
+        LightClientStateUpdateCertificateV2, NextEpochQuorumCertificate2, QuorumCertificate2,
         UpgradeCertificate,
     },
+    traits::metrics::Metrics,
 };
-use indexmap::IndexMap;
 
 use crate::{NodeType, SeqTypes, ViewNumber};
 
@@ -87,6 +88,10 @@ impl SequencerPersistence for NoStorage {
     }
 
     async fn load_latest_acted_view(&self) -> anyhow::Result<Option<ViewNumber>> {
+        Ok(None)
+    }
+
+    async fn load_restart_view(&self) -> anyhow::Result<Option<ViewNumber>> {
         Ok(None)
     }
 
@@ -212,7 +217,7 @@ impl SequencerPersistence for NoStorage {
         Ok(())
     }
 
-    async fn add_drb_result(
+    async fn store_drb_result(
         &self,
         _epoch: EpochNumber,
         _drb_result: DrbResult,
@@ -220,7 +225,14 @@ impl SequencerPersistence for NoStorage {
         Ok(())
     }
 
-    async fn add_epoch_root(
+    async fn store_drb_input(&self, _drb_input: DrbInput) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn load_drb_input(&self, _epoch: u64) -> anyhow::Result<DrbInput> {
+        bail!("Cannot load from NoStorage")
+    }
+
+    async fn store_epoch_root(
         &self,
         _epoch: EpochNumber,
         _block_header: <SeqTypes as NodeType>::BlockHeader,
@@ -234,16 +246,18 @@ impl SequencerPersistence for NoStorage {
 
     async fn add_state_cert(
         &self,
-        _state_cert: LightClientStateUpdateCertificate<SeqTypes>,
+        _state_cert: LightClientStateUpdateCertificateV2<SeqTypes>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
 
     async fn load_state_cert(
         &self,
-    ) -> anyhow::Result<Option<LightClientStateUpdateCertificate<SeqTypes>>> {
+    ) -> anyhow::Result<Option<LightClientStateUpdateCertificateV2<SeqTypes>>> {
         Ok(None)
     }
+
+    fn enable_metrics(&mut self, _metrics: &dyn Metrics) {}
 }
 
 #[async_trait]
@@ -251,7 +265,7 @@ impl MembershipPersistence for NoStorage {
     async fn load_stake(
         &self,
         _epoch: EpochNumber,
-    ) -> anyhow::Result<Option<IndexMap<alloy::primitives::Address, Validator<BLSPubKey>>>> {
+    ) -> anyhow::Result<Option<(ValidatorMap, Option<RewardAmount>)>> {
         Ok(None)
     }
 
@@ -262,8 +276,39 @@ impl MembershipPersistence for NoStorage {
     async fn store_stake(
         &self,
         _epoch: EpochNumber,
-        _stake: IndexMap<alloy::primitives::Address, Validator<BLSPubKey>>,
+        _stake: ValidatorMap,
+        _block_reward: Option<RewardAmount>,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    async fn store_events(
+        &self,
+        _l1: u64,
+        _events: Vec<(EventKey, StakeTableEvent)>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn load_events(
+        &self,
+        _l1_block: u64,
+    ) -> anyhow::Result<(
+        Option<EventsPersistenceRead>,
+        Vec<(EventKey, StakeTableEvent)>,
+    )> {
+        Ok((None, Vec::new()))
+    }
+}
+
+#[async_trait]
+impl DhtPersistentStorage for NoStorage {
+    /// Don't do anything
+    async fn save(&self, _records: Vec<SerializableRecord>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Don't do anything
+    async fn load(&self) -> anyhow::Result<Vec<SerializableRecord>> {
+        Ok(vec![])
     }
 }

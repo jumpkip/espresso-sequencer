@@ -29,7 +29,9 @@ use super::{
     Storable,
 };
 use crate::{
-    availability::{BlockId, QueryablePayload, VidCommonMetadata, VidCommonQueryData},
+    availability::{
+        BlockId, QueryableHeader, QueryablePayload, VidCommonMetadata, VidCommonQueryData,
+    },
     data_source::{
         storage::{
             pruning::PrunedHeightStorage, AvailabilityStorage, NodeStorage,
@@ -67,6 +69,7 @@ where
 impl<Types> Fetchable<Types> for VidCommonQueryData<Types>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     type Request = VidCommonRequest<Types>;
@@ -125,6 +128,7 @@ where
 impl<Types> RangedFetchable<Types> for VidCommonQueryData<Types>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     type RangedRequest = VidCommonRequest<Types>;
@@ -185,6 +189,7 @@ pub(super) fn fetch_vid_common_with_header<Types, S, P>(
     header: Header<Types>,
 ) where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
     S: VersionedDataSource + 'static,
     for<'a> S::Transaction<'a>: UpdateAvailabilityStorage<Types>,
@@ -241,13 +246,13 @@ impl<Types: NodeType, S, P> PartialOrd for VidCommonCallback<Types, S, P> {
 
 impl<Types: NodeType, S, P> Callback<VidCommon> for VidCommonCallback<Types, S, P>
 where
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
     S: VersionedDataSource + 'static,
     for<'a> S::Transaction<'a>: UpdateAvailabilityStorage<Types>,
     P: AvailabilityProvider<Types>,
 {
     async fn run(self, common: VidCommon) {
-        tracing::info!("fetched VID common {:?}", self.header.payload_commitment());
         let common = VidCommonQueryData::new(self.header, common);
         self.fetcher.store_and_notify(common).await;
     }
@@ -257,6 +262,7 @@ where
 impl<Types> Fetchable<Types> for VidCommonMetadata<Types>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     type Request = VidCommonRequest<Types>;
@@ -315,6 +321,7 @@ where
 impl<Types> RangedFetchable<Types> for VidCommonMetadata<Types>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
 {
     type RangedRequest = VidCommonRequest<Types>;

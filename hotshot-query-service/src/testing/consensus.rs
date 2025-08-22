@@ -10,8 +10,9 @@
 // You should have received a copy of the GNU General Public License along with this program. If not,
 // see <https://www.gnu.org/licenses/>.
 
-use std::{fmt::Display, num::NonZeroUsize, str::FromStr, sync::Arc, time::Duration};
+use std::{fmt::Display, num::NonZeroUsize, sync::Arc, time::Duration};
 
+use alloy::primitives::U256;
 use async_lock::RwLock;
 use async_trait::async_trait;
 use futures::{
@@ -21,12 +22,9 @@ use futures::{
 use hotshot::{
     traits::implementations::{MasterMap, MemoryNetwork},
     types::{Event, SystemContextHandle},
-    HotShotInitializer, MarketplaceConfig, SystemContext,
+    HotShotInitializer, SystemContext,
 };
-use hotshot_example_types::{
-    auction_results_provider_types::TestAuctionResultsProvider, state_types::TestInstanceState,
-    storage_types::TestStorage,
-};
+use hotshot_example_types::{state_types::TestInstanceState, storage_types::TestStorage};
 use hotshot_testing::block_builder::{SimpleBuilderImplementation, TestBuilderImplementation};
 use hotshot_types::{
     consensus::ConsensusMetricsValue,
@@ -35,6 +33,7 @@ use hotshot_types::{
     epoch_membership::EpochMembershipCoordinator,
     light_client::StateKeyPair,
     signature_key::BLSPubKey,
+    storage_metrics::StorageMetricsValue,
     traits::{
         election::Membership,
         network::Topic,
@@ -43,7 +42,6 @@ use hotshot_types::{
     },
     HotShotConfig, PeerConfig,
 };
-use primitive_types::U256;
 use tokio::{
     runtime::Handle,
     task::{block_in_place, yield_now},
@@ -80,6 +78,8 @@ pub type MockDataSource = FileSystemDataSource<MockTypes, NoFetching>;
 pub type MockSqlDataSource = SqlDataSource<MockTypes, NoFetching>;
 
 pub const NUM_NODES: usize = 2;
+const EPOCH_HEIGHT: u64 = 10;
+const DIFFICULTY_LEVEL: u64 = 10;
 
 impl<D: DataSourceLifeCycle + UpdateStatusData, V: Versions> MockNetwork<D, V> {
     pub async fn init() -> Self {
@@ -156,8 +156,11 @@ impl<D: DataSourceLifeCycle + UpdateStatusData, V: Versions> MockNetwork<D, V> {
             stop_proposing_time: 0,
             start_voting_time: 0,
             stop_voting_time: 0,
-            epoch_height: 10,
+            epoch_height: EPOCH_HEIGHT,
             epoch_start_block: 0,
+            stake_table_capacity: hotshot_types::light_client::DEFAULT_STAKE_TABLE_CAPACITY,
+            drb_difficulty: DIFFICULTY_LEVEL,
+            drb_upgrade_difficulty: DIFFICULTY_LEVEL,
         };
         update_config(&mut config);
 
@@ -197,8 +200,11 @@ impl<D: DataSourceLifeCycle + UpdateStatusData, V: Versions> MockNetwork<D, V> {
                             .write()
                             .await
                             .set_first_epoch(ViewNumber::new(0), INITIAL_DRB_RESULT);
-                        let memberships =
-                            EpochMembershipCoordinator::new(membership, config.epoch_height);
+                        let memberships = EpochMembershipCoordinator::new(
+                            membership,
+                            config.epoch_height,
+                            &hs_storage.clone(),
+                        );
 
                         let hotshot = SystemContext::init(
                             pub_keys[node_id],
@@ -218,12 +224,7 @@ impl<D: DataSourceLifeCycle + UpdateStatusData, V: Versions> MockNetwork<D, V> {
                             .unwrap(),
                             ConsensusMetricsValue::new(&*data_source.populate_metrics()),
                             hs_storage,
-                            MarketplaceConfig {
-                                auction_results_provider: Arc::new(
-                                    TestAuctionResultsProvider::default(),
-                                ),
-                                fallback_builder_url: Url::from_str("https://some.url").unwrap(),
-                            },
+                            StorageMetricsValue::new(&*data_source.populate_metrics()),
                         )
                         .await
                         .unwrap()
@@ -295,6 +296,10 @@ impl<D: DataSourceLifeCycle, V: Versions> MockNetwork<D, V> {
         for node in &mut self.nodes {
             node.hotshot.shut_down().await;
         }
+    }
+
+    pub fn epoch_height(&self) -> u64 {
+        EPOCH_HEIGHT
     }
 }
 

@@ -73,6 +73,7 @@ fn internal<M: Display>(msg: M) -> Error {
 pub fn define_api<State, Ver: StaticVersionType + 'static>(
     options: &Options,
     _: Ver,
+    api_ver: semver::Version,
 ) -> Result<Api<State, Error, Ver>, ApiError>
 where
     State: 'static + Send + Sync + ReadState,
@@ -83,7 +84,7 @@ where
         include_str!("../api/status.toml"),
         options.extensions.clone(),
     )?;
-    api.with_version("0.0.1".parse().unwrap())
+    api.with_version(api_ver)
         .get("block_height", |_, state| {
             async { state.block_height().await.map_err(internal) }.boxed()
         })?
@@ -125,15 +126,13 @@ mod test {
         testing::{
             consensus::{MockDataSource, MockNetwork},
             mocks::{MockBase, MockVersions},
-            setup_test, sleep,
+            sleep,
         },
         ApiState, Error,
     };
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_api() {
-        setup_test();
-
         // Create the consensus network.
         let mut network = MockNetwork::<MockDataSource, MockVersions>::init().await;
 
@@ -142,16 +141,21 @@ mod test {
         let mut app = App::<_, Error>::with_state(ApiState::from(network.data_source()));
         app.register_module(
             "status",
-            define_api(&Default::default(), MockBase::instance()).unwrap(),
+            define_api(
+                &Default::default(),
+                MockBase::instance(),
+                "0.0.1".parse().unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap();
         network.spawn(
             "server",
-            app.serve(format!("0.0.0.0:{}", port), MockBase::instance()),
+            app.serve(format!("0.0.0.0:{port}"), MockBase::instance()),
         );
 
         // Start a client.
-        let url = Url::from_str(&format!("http://localhost:{}/status", port)).unwrap();
+        let url = Url::from_str(&format!("http://localhost:{port}/status")).unwrap();
         let client = Client::<Error, MockBase>::new(url.clone());
         assert!(client.connect(Some(Duration::from_secs(60))).await);
 
@@ -178,8 +182,7 @@ mod test {
         let lines = prometheus.lines().collect::<Vec<_>>();
         assert!(
             lines.contains(&"consensus_current_view 0"),
-            "Missing consensus_current_view in metrics:\n{}",
-            prometheus
+            "Missing consensus_current_view in metrics:\n{prometheus}"
         );
 
         // Start the validators and wait for the block to be finalized.
@@ -202,10 +205,8 @@ mod test {
         network.shut_down().await;
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_extensions() {
-        setup_test();
-
         let dir = TempDir::with_prefix("test_status_extensions").unwrap();
         let data_source = ExtensibleDataSource::new(
             MockDataSource::create(dir.path(), Default::default())
@@ -231,6 +232,7 @@ mod test {
                 ..Default::default()
             },
             MockBase::instance(),
+            "0.0.1".parse().unwrap(),
         )
         .unwrap();
         api.get("get_ext", |_, state| {
@@ -252,11 +254,11 @@ mod test {
         let port = pick_unused_port().unwrap();
         let _server = BackgroundTask::spawn(
             "server",
-            app.serve(format!("0.0.0.0:{}", port), MockBase::instance()),
+            app.serve(format!("0.0.0.0:{port}"), MockBase::instance()),
         );
 
         let client = Client::<Error, MockBase>::new(
-            format!("http://localhost:{}/status", port).parse().unwrap(),
+            format!("http://localhost:{port}/status").parse().unwrap(),
         );
         assert!(client.connect(Some(Duration::from_secs(60))).await);
 

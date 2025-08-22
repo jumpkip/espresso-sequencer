@@ -18,7 +18,6 @@ use async_lock::Mutex;
 use async_trait::async_trait;
 use futures::future::Future;
 use hotshot_types::{data::VidShare, traits::node_implementation::NodeType};
-use vec1::Vec1;
 
 use super::{
     pruning::{PruneStorage, PrunedHeightStorage, PrunerCfg, PrunerConfig},
@@ -28,8 +27,9 @@ use super::{
 };
 use crate::{
     availability::{
-        BlockId, BlockQueryData, LeafId, LeafQueryData, PayloadQueryData, QueryablePayload,
-        TransactionHash, TransactionQueryData, VidCommonQueryData,
+        BlockId, BlockQueryData, LeafId, LeafQueryData, NamespaceId, PayloadQueryData,
+        QueryableHeader, QueryablePayload, StateCertQueryDataV2, TransactionHash,
+        VidCommonQueryData,
     },
     data_source::{
         storage::{PayloadMetadata, VidCommonMetadata},
@@ -48,7 +48,6 @@ pub enum FailableAction {
     // can always add more variants for other actions.
     GetHeader,
     GetLeaf,
-    GetLeaves,
     GetBlock,
     GetPayload,
     GetPayloadMetadata,
@@ -63,6 +62,7 @@ pub enum FailableAction {
     GetVidCommonMetadataRange,
     GetTransaction,
     FirstAvailableLeaf,
+    GetStateCert,
 
     /// Target any action for failure.
     Any,
@@ -262,7 +262,7 @@ impl<S, Types: NodeType> MigrateTypes<Types> for FailStorage<S>
 where
     S: MigrateTypes<Types> + Sync,
 {
-    async fn migrate_types(&self) -> anyhow::Result<()> {
+    async fn migrate_types(&self, _batch_size: u64) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -330,17 +330,13 @@ where
 impl<Types, T> AvailabilityStorage<Types> for Transaction<T>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
     T: AvailabilityStorage<Types>,
 {
     async fn get_leaf(&mut self, id: LeafId<Types>) -> QueryResult<LeafQueryData<Types>> {
         self.maybe_fail_read(FailableAction::GetLeaf).await?;
         self.inner.get_leaf(id).await
-    }
-
-    async fn get_leaves(&mut self, height: u64) -> QueryResult<Vec1<LeafQueryData<Types>>> {
-        self.maybe_fail_read(FailableAction::GetLeaves).await?;
-        self.inner.get_leaves(height).await
     }
 
     async fn get_block(&mut self, id: BlockId<Types>) -> QueryResult<BlockQueryData<Types>> {
@@ -454,12 +450,12 @@ where
         self.inner.get_vid_common_metadata_range(range).await
     }
 
-    async fn get_transaction(
+    async fn get_block_with_transaction(
         &mut self,
         hash: TransactionHash<Types>,
-    ) -> QueryResult<TransactionQueryData<Types>> {
+    ) -> QueryResult<BlockQueryData<Types>> {
         self.maybe_fail_read(FailableAction::GetTransaction).await?;
-        self.inner.get_transaction(hash).await
+        self.inner.get_block_with_transaction(hash).await
     }
 
     async fn first_available_leaf(&mut self, from: u64) -> QueryResult<LeafQueryData<Types>> {
@@ -467,11 +463,17 @@ where
             .await?;
         self.inner.first_available_leaf(from).await
     }
+
+    async fn get_state_cert(&mut self, epoch: u64) -> QueryResult<StateCertQueryDataV2<Types>> {
+        self.maybe_fail_read(FailableAction::GetStateCert).await?;
+        self.inner.get_state_cert(epoch).await
+    }
 }
 
 impl<Types, T> UpdateAvailabilityStorage<Types> for Transaction<T>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     Payload<Types>: QueryablePayload<Types>,
     T: UpdateAvailabilityStorage<Types> + Send + Sync,
 {
@@ -493,6 +495,14 @@ where
         self.maybe_fail_write(FailableAction::Any).await?;
         self.inner.insert_vid(common, share).await
     }
+
+    async fn insert_state_cert(
+        &mut self,
+        state_cert: StateCertQueryDataV2<Types>,
+    ) -> anyhow::Result<()> {
+        self.maybe_fail_write(FailableAction::Any).await?;
+        self.inner.insert_state_cert(state_cert).await
+    }
 }
 
 #[async_trait]
@@ -510,6 +520,7 @@ where
 impl<Types, T> NodeStorage<Types> for Transaction<T>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     T: NodeStorage<Types> + Send + Sync,
 {
     async fn block_height(&mut self) -> QueryResult<usize> {
@@ -520,17 +531,21 @@ where
     async fn count_transactions_in_range(
         &mut self,
         range: impl RangeBounds<usize> + Send,
+        namespace: Option<NamespaceId<Types>>,
     ) -> QueryResult<usize> {
         self.maybe_fail_read(FailableAction::Any).await?;
-        self.inner.count_transactions_in_range(range).await
+        self.inner
+            .count_transactions_in_range(range, namespace)
+            .await
     }
 
     async fn payload_size_in_range(
         &mut self,
         range: impl RangeBounds<usize> + Send,
+        namespace: Option<NamespaceId<Types>>,
     ) -> QueryResult<usize> {
         self.maybe_fail_read(FailableAction::Any).await?;
-        self.inner.payload_size_in_range(range).await
+        self.inner.payload_size_in_range(range, namespace).await
     }
 
     async fn vid_share<ID>(&mut self, id: ID) -> QueryResult<VidShare>
@@ -557,16 +572,18 @@ where
     }
 }
 
-impl<T> AggregatesStorage for Transaction<T>
+impl<Types, T> AggregatesStorage<Types> for Transaction<T>
 where
-    T: AggregatesStorage + Send + Sync,
+    Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
+    T: AggregatesStorage<Types> + Send + Sync,
 {
     async fn aggregates_height(&mut self) -> anyhow::Result<usize> {
         self.maybe_fail_read(FailableAction::Any).await?;
         self.inner.aggregates_height().await
     }
 
-    async fn load_prev_aggregate(&mut self) -> anyhow::Result<Option<Aggregate>> {
+    async fn load_prev_aggregate(&mut self) -> anyhow::Result<Option<Aggregate<Types>>> {
         self.maybe_fail_read(FailableAction::Any).await?;
         self.inner.load_prev_aggregate().await
     }
@@ -575,13 +592,14 @@ where
 impl<T, Types> UpdateAggregatesStorage<Types> for Transaction<T>
 where
     Types: NodeType,
+    Header<Types>: QueryableHeader<Types>,
     T: UpdateAggregatesStorage<Types> + Send + Sync,
 {
     async fn update_aggregates(
         &mut self,
-        prev: Aggregate,
+        prev: Aggregate<Types>,
         blocks: &[PayloadMetadata<Types>],
-    ) -> anyhow::Result<Aggregate> {
+    ) -> anyhow::Result<Aggregate<Types>> {
         self.maybe_fail_write(FailableAction::Any).await?;
         self.inner.update_aggregates(prev, blocks).await
     }
